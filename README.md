@@ -490,6 +490,20 @@ Invoke-ScriptAnalyzer -Path .\tests -Recurse
 - 当前实现只在有限环境中验证，不能替代完整的跨平台和全 Provider 测试。
 - 不建议将 Bridge 监听地址暴露到局域网或公网。
 
+## 非 Provider 类问题
+
+Codex Desktop 的以下错误与 CC Switch、Bridge 均无关：
+
+```text
+App-server queued follow-up no longer exists
+```
+
+这是 Desktop 队列编辑状态机问题。上游维护者已经确认修复会进入下一版本。
+详细分析、本机日志特征与恢复方式见：
+
+- `docs/queued-follow-up.zh-CN.md`
+- https://github.com/openai/codex/issues/44781
+
 ## 相关社区问题
 
 - `farion1231/cc-switch#5398`
