@@ -8,6 +8,7 @@ param(
         "repair",
         "backup",
         "restore",
+        "migrate-history",
         "list-snapshots",
         "status"
     )]
@@ -19,6 +20,8 @@ param(
     [ValidateSet("all", "conversation", "none")]
     [string]$HistoryScope = "all",
     [string]$ConversationId = "",
+    [string]$TargetProvider = "custom",
+    [switch]$ApplyMigration,
     [switch]$LockNextConversation,
     [string]$SnapshotId = "",
     [switch]$RestoreCcSwitchSettings
@@ -30,6 +33,7 @@ $TaskName = $script:CodexBridgeTaskName
 $BridgeScript = Join-Path (Split-Path $PSScriptRoot -Parent) "src\codex_cross_provider_bridge.py"
 $RepairScript = Join-Path $PSScriptRoot "Repair-Codex-CCSwitchProviderAlias.ps1"
 $AuditScript = Join-Path (Split-Path $PSScriptRoot -Parent) "src\codex_history_audit.py"
+$MigrateScript = Join-Path (Split-Path $PSScriptRoot -Parent) "src\codex_thread_provider_migrate.py"
 $ConfigPath = Join-Path $env:USERPROFILE ".codex\config.toml"
 $BridgeUrl = "http://127.0.0.1:$BridgePort/v1"
 $BridgeStateDirectory = Join-Path (Split-Path $PSScriptRoot -Parent) "state"
@@ -301,6 +305,41 @@ switch ($Action) {
         Write-Output "restored_snapshot=$($result.RestoredSnapshotId)"
         Write-Output "pre_restore_snapshot=$($result.PreRestoreSnapshotId)"
     }
+    "migrate-history" {
+        if (-not $ConversationId) {
+            throw "ConversationId is required for migrate-history"
+        }
+        if (-not (Test-Path -LiteralPath $MigrateScript -PathType Leaf)) {
+            throw "Migration script not found: $MigrateScript"
+        }
+        if ($ApplyMigration) {
+            $snapshot = New-CodexBridgeSnapshot `
+                -Reason "pre-migration" `
+                -ConfigPath $ConfigPath `
+                -BridgeScript $BridgeScript `
+                -TaskName $TaskName
+        }
+
+        $python = Get-PythonPath
+        $arguments = @(
+            $MigrateScript,
+            "--conversation-id",
+            $ConversationId,
+            "--target-provider",
+            $TargetProvider
+        )
+        if ($ApplyMigration) {
+            $arguments += "--apply"
+        }
+        $output = & $python @arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "Thread provider migration failed"
+        }
+        Write-Output $output
+        if ($ApplyMigration) {
+            Write-Output "config_snapshot=$($snapshot.SnapshotId)"
+        }
+    }
     "list-snapshots" {
         Get-CodexBridgeSnapshotList |
             Where-Object ConfigPath -eq (Get-NormalizedPath -Path $ConfigPath) |
@@ -379,10 +418,15 @@ switch ($Action) {
             Write-Output "conversation_history_found=$($audit.threadFound)"
             Write-Output "conversation_history_repair_required=$($audit.historyRepairRequired)"
             Write-Output "conversation_missing_provider_ids=$($audit.missingProviderIds -join ',')"
+            Write-Output "conversation_runtime_provider_ids=$($audit.runtimeProviderIds -join ',')"
+            Write-Output "remote_compact_risk=$($audit.remoteCompactRisk)"
             if ($audit.threads -and $audit.threads.Count -gt 0) {
                 Write-Output "conversation_title=$($audit.threads[0].title)"
                 Write-Output "conversation_cwd=$($audit.threads[0].cwd)"
                 Write-Output "conversation_provider=$($audit.threads[0].modelProvider)"
+            }
+            if ($audit.remoteCompactRisk) {
+                Write-Output "remote_compact_repair_command=.\scripts\Manage-CodexCrossProviderBridge.ps1 -Action migrate-history -ConversationId `"$auditConversationId`" -TargetProvider custom -ApplyMigration"
             }
         }
     }

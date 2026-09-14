@@ -137,6 +137,62 @@ Bridge 会优先保证可见消息、助手消息、工具调用和工具结果�
 - 不能保证保留完整隐藏推理；
 - 不能把 Anthropic、Gemini 或其他非 Responses 协议凭空转换成 Responses。
 
+### 现象三：返回 ChatGPT 账号不支持的第三方模型
+
+手动执行 `/compact` 或自动压缩时，可能出现：
+
+```text
+Error running remote compact task:
+The 'deepseek-flash' model is not supported when using Codex with a ChatGPT account.
+```
+
+本地历史记录中可观察到：
+
+```text
+session_meta.model_provider = "openai"
+thread_settings_applied.model_provider_id = "openai"
+thread_settings_applied.model = "deepseek-flash"
+```
+
+根因不是压缩提示词，也不是 Bridge 的请求清理规则，而是持久化的运行时
+provider 与模型不匹配：
+
+```text
+model = deepseek-flash
+provider = openai
+```
+
+远程压缩会读取这个持久化 provider，并把 `deepseek-flash` 发送到 ChatGPT
+账号后端，因此被拒绝。压缩请求可能绕过自定义 provider 的 `base_url`，
+所以仅给 provider 增加本地别名或清理请求内容并不足以修复。
+
+修复方式是只在用户指定的历史会话中，将持久化 provider 状态迁移到当前
+兼容 provider，例如 `custom`。迁移前会备份 rollout JSONL 和
+`state_5.sqlite`，成功后同时更新：
+
+- session meta
+- `thread_settings_applied.model_provider_id`
+- `state_5.sqlite.threads.model_provider`
+
+先预览：
+
+```powershell
+.\scripts\Manage-CodexCrossProviderBridge.ps1 `
+  -Action migrate-history `
+  -ConversationId "<conversation-id>" `
+  -TargetProvider custom
+```
+
+确认后应用：
+
+```powershell
+.\scripts\Manage-CodexCrossProviderBridge.ps1 `
+  -Action migrate-history `
+  -ConversationId "<conversation-id>" `
+  -TargetProvider custom `
+  -ApplyMigration
+```
+
 ## 修复思路
 
 ### 历史会话
@@ -339,6 +395,14 @@ manual
 5. 如快照包含计划任务 XML，则恢复任务。
 6. 失败时自动回滚到 `pre-restore` 快照。
 
+单会话 provider 迁移另有独立备份：
+
+```text
+~/.codex/backups/codex-thread-provider-migrate/<conversation-id>-<timestamp>/
+```
+
+其中包含迁移前的 rollout JSONL、完整 `state_5.sqlite` 和 manifest。
+
 列出快照：
 
 ```powershell
@@ -382,10 +446,12 @@ CC Switch 设置默认只备份、不覆盖。需要恢复时显式指定：
 |   `-- Restore-CodexCrossProviderState.ps1
 |-- src/
 |   |-- codex_cross_provider_bridge.py
-|   `-- codex_history_audit.py
+|   |-- codex_history_audit.py
+|   `-- codex_thread_provider_migrate.py
 `-- tests/
     |-- Test-CodexBridgeConfig.ps1
-    `-- test_codex_cross_provider_bridge.py
+    |-- test_codex_cross_provider_bridge.py
+    `-- test_thread_provider_migrate.py
 ```
 
 ## 验证
@@ -407,6 +473,9 @@ Invoke-ScriptAnalyzer -Path .\tests -Recurse
 - `previous_response_id` 清理
 - 保守重试
 - 流式转发
+- legacy `/responses/compact` 清理
+- 远程压缩 provider/model 风险检测
+- 单会话 provider 状态迁移与备份
 - 备份与恢复
 - 重复执行幂等性
 - PowerShell 语法与静态分析
@@ -414,6 +483,8 @@ Invoke-ScriptAnalyzer -Path .\tests -Recurse
 ## 已知限制
 
 - CC Switch 切换 Provider 后可能再次覆写 `config.toml`，需要重新执行 `repair`。
+- 历史线程如果仍以 `openai` provider 搭配第三方模型运行，需要执行一次单会话
+  provider 状态迁移。
 - 历史会话修复不等于跨 Provider 的隐藏 reasoning 无损迁移。
 - 不同 Provider 的协议、模型、工具 schema 和上下文窗口仍可能不兼容。
 - 当前实现只在有限环境中验证，不能替代完整的跨平台和全 Provider 测试。
@@ -428,3 +499,9 @@ Invoke-ScriptAnalyzer -Path .\tests -Recurse
 - `farion1231/cc-switch#6503`
 - `farion1231/cc-switch#6658`
 - `farion1231/cc-switch#7257`
+- `farion1231/cc-switch#5536`
+- `farion1231/cc-switch#4725`
+- `farion1231/cc-switch#6156`
+- `openai/codex#38930`
+- `openai/codex#42313`
+- `openai/codex#37010`

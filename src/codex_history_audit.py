@@ -33,16 +33,18 @@ def read_thread_rows(codex_home: Path) -> list[dict]:
             return []
         title_expression = "title" if "title" in columns else "''"
         cwd_expression = "cwd" if "cwd" in columns else "''"
+        model_expression = "model" if "model" in columns else "''"
         rollout_expression = "rollout_path" if "rollout_path" in columns else "''"
         rows = []
-        for thread_id, provider, title, cwd, path in connection.execute(
-            f"select id, model_provider, {title_expression}, "
+        for thread_id, provider, model, title, cwd, path in connection.execute(
+            f"select id, model_provider, {model_expression}, {title_expression}, "
             f"{cwd_expression}, {rollout_expression} from threads"
         ):
             rows.append(
                 {
                     "conversationId": str(thread_id),
                     "modelProvider": str(provider or ""),
+                    "model": str(model or ""),
                     "title": str(title or ""),
                     "cwd": str(cwd or ""),
                     "rolloutPath": str(path or ""),
@@ -51,6 +53,44 @@ def read_thread_rows(codex_home: Path) -> list[dict]:
         return rows
     finally:
         connection.close()
+
+
+def read_runtime_provider_ids(rollout_path: str) -> list[str]:
+    if not rollout_path:
+        return []
+    path = Path(rollout_path)
+    if not path.exists():
+        return []
+
+    provider_ids = set()
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = item.get("payload") or {}
+            if (
+                item.get("type") == "event_msg"
+                and payload.get("type") == "thread_settings_applied"
+            ):
+                settings = payload.get("thread_settings") or {}
+                provider = settings.get("model_provider_id")
+                if provider:
+                    provider_ids.add(str(provider))
+    return sorted(provider_ids)
+
+
+def is_official_model(model: str) -> bool:
+    normalized = model.strip().lower()
+    return (
+        normalized.startswith("gpt-")
+        or normalized.startswith("codex")
+        or normalized in {"o1", "o3", "o4"}
+        or normalized.startswith("o1-")
+        or normalized.startswith("o3-")
+        or normalized.startswith("o4-")
+    )
 
 
 def audit_history(
@@ -68,6 +108,23 @@ def audit_history(
     provider_ids = sorted(
         {row["modelProvider"] for row in rows if row["modelProvider"]}
     )
+    runtime_provider_ids = sorted(
+        {
+            provider
+            for row in rows
+            for provider in read_runtime_provider_ids(row.get("rolloutPath", ""))
+        }
+    )
+    remote_compact_risk = any(
+        provider == "openai"
+        and row.get("model")
+        and not is_official_model(row["model"])
+        for row in rows
+        for provider in (
+            read_runtime_provider_ids(row.get("rolloutPath", ""))
+            or [row.get("modelProvider", "")]
+        )
+    )
     configured_ids = read_config_provider_ids(config_path)
     required_ids = [
         provider
@@ -83,6 +140,8 @@ def audit_history(
         "matchedThreads": len(rows),
         "threads": rows[:100],
         "providerIds": provider_ids,
+        "runtimeProviderIds": runtime_provider_ids,
+        "remoteCompactRisk": remote_compact_risk,
         "requiredProviderIds": required_ids,
         "configuredProviderIds": sorted(configured_ids),
         "missingProviderIds": missing_ids,

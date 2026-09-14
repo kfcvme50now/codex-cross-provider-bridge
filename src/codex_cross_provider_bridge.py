@@ -317,7 +317,10 @@ def override_model(payload: object, model_override: str) -> object:
 
 
 def _is_responses_path(path: str) -> bool:
-    return urlsplit(path).path.rstrip("/").endswith("/responses")
+    normalized = urlsplit(path).path.rstrip("/")
+    return normalized.endswith("/responses") or normalized.endswith(
+        "/responses/compact"
+    )
 
 
 class BridgeHandler(BaseHTTPRequestHandler):

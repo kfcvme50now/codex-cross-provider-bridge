@@ -47,6 +47,34 @@ code: invalid_value
 
 根因是旧历史中的 ID 由原 provider 创建，新 provider 不接受其格式或服务端归属。
 
+## 第三类：远程压缩使用旧 provider
+
+压缩失败时可能出现：
+
+```text
+Error running remote compact task:
+The 'deepseek-flash' model is not supported when using Codex with a ChatGPT account.
+```
+
+历史记录中的持久化运行时设置为：
+
+```text
+model_provider_id = "openai"
+model = "deepseek-flash"
+```
+
+远程压缩读取的是持久化 provider，而不是当前 `config.toml` 中的 provider。
+请求因此被发往 ChatGPT 后端，第三方模型被拒绝。
+
+该问题不能仅靠请求清理解决，需要为指定会话迁移持久化 provider 状态：
+
+- rollout `session_meta`
+- rollout `thread_settings_applied.model_provider_id`
+- `state_5.sqlite.threads.model_provider`
+
+迁移工具默认只预览，使用 `-ApplyMigration` 后才写入，并在写入前备份 rollout
+和完整 SQLite 数据库。
+
 ## 修复层
 
 ### 历史会话

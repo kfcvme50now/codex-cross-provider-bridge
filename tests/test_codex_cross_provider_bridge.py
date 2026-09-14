@@ -199,6 +199,45 @@ class _MockResponsesHandler(BaseHTTPRequestHandler):
 
 
 class BridgeIntegrationTests(unittest.TestCase):
+    def test_legacy_compact_endpoint_is_sanitized(self) -> None:
+        _MockResponsesHandler.requests = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _MockResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(upstream.server_port)
+            try:
+                body = json.dumps(sample_payload()).encode("utf-8")
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=5,
+                )
+                connection.request(
+                    "POST",
+                    "/v1/responses/compact",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertTrue(_MockResponsesHandler.requests)
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
     def test_retries_with_portable_history_after_opaque_state_rejection(self) -> None:
         _MockResponsesHandler.requests = []
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), _MockResponsesHandler)
