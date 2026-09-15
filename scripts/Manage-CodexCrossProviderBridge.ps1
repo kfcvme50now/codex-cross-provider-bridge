@@ -1001,8 +1001,8 @@ switch ($Action) {
         Write-Output "post_switch_scope=$(if ($lifecycle) { $lifecycle.policy.postSwitchScope } else { 'unknown' })"
         Write-Output "lifecycle_status_event=$(if ($lifecycleStatus) { $lifecycleStatus.event } else { '' })"
         Write-Output "lifecycle_status_result=$(if ($lifecycleStatus) { $lifecycleStatus.result } else { '' })"
-        Write-Output "lifecycle_status_title=$(if ($lifecycleStatus) { $lifecycleStatus.conversationTitle } else { '' })"
-        Write-Output "lifecycle_status_cwd=$(if ($lifecycleStatus) { $lifecycleStatus.conversationCwd } else { '' })"
+        Write-Output "lifecycle_status_title=$(if ($lifecycleStatus -and $lifecycleStatus.PSObject.Properties['conversationTitle']) { $lifecycleStatus.conversationTitle } else { '' })"
+        Write-Output "lifecycle_status_cwd=$(if ($lifecycleStatus -and $lifecycleStatus.PSObject.Properties['conversationCwd']) { $lifecycleStatus.conversationCwd } else { '' })"
         Write-Output "branch_history_file=$BranchHistoryFile"
         if ($runtimeStatus -and $runtimeStatus.lastRequest) {
             $lastRequest = $runtimeStatus.lastRequest

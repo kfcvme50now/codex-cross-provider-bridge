@@ -424,6 +424,8 @@ class RouteRepairHookTests(unittest.TestCase):
             status = json.loads(status_path.read_text(encoding="utf-8"))
             self.assertEqual(status["result"], "repaired")
             self.assertEqual(status["routeAfter"], BRIDGE_URL)
+            self.assertIn("conversationTitle", status)
+            self.assertIn("conversationCwd", status)
             events = events_path.read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(events), 1)
 

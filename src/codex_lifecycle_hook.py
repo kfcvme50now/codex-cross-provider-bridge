@@ -16,6 +16,7 @@ from typing import Callable
 
 from codex_branch_handoff import run_branch_handoff
 from codex_config_guard import inspect_config_route
+from codex_cross_provider_bridge import lookup_conversation_metadata
 from codex_internal import INTERNAL_ENV
 from codex_lifecycle_policy import (
     _normalize_policy,
@@ -512,10 +513,16 @@ def run_user_prompt_submit_hook(
     else:
         output = {"continue": True}
 
+    try:
+        metadata = lookup_conversation_metadata(codex_home, session_id)
+    except Exception:  # noqa: BLE001 - metadata is only for logging
+        metadata = {}
     recorded = {
         "event": "UserPromptSubmit",
         "timestamp": time.time(),
         "sessionId": session_id,
+        "conversationTitle": str(metadata.get("title") or ""),
+        "conversationCwd": str(metadata.get("cwd") or ""),
         "turnId": str(event.get("turn_id") or ""),
         "cwd": str(event.get("cwd") or ""),
         "model": str(event.get("model") or ""),
