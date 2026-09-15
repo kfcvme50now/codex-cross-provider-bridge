@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -410,8 +411,275 @@ class HistoryAuditTests(unittest.TestCase):
             self.assertEqual(metadata["cwd"], r"C:\work\example")
 
 
-def start_bridge(upstream_port: int):
-    from codex_cross_provider_bridge import create_server
+class _StallingResponsesHandler(BaseHTTPRequestHandler):
+    """Sends SSE headers plus one event, then goes silent like a stalled provider."""
+
+    started: threading.Event = threading.Event()
+    release: threading.Event = threading.Event()
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(b'data: {"type":"response.created"}\n\n')
+        self.wfile.flush()
+        type(self).started.set()
+        type(self).release.wait(timeout=30)
+
+
+class _SilentResponsesHandler(BaseHTTPRequestHandler):
+    """Keeps the client waiting before any response headers are sent."""
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        time.sleep(5)
+        body = b'{"type":"response.completed","response":{"output":[]}}'
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+
+def _read_status(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _wait_for_last_request(
+    path: Path,
+    expected_outcome: str,
+    timeout: float = 15,
+) -> dict:
+    """The bridge records the outcome once the client response is finished."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        payload = _read_status(path) or {}
+        last_request = payload.get("lastRequest")
+        if isinstance(last_request, dict) and last_request.get("outcome") == expected_outcome:
+            return last_request
+        time.sleep(0.05)
+    raise AssertionError(f"last request never reached outcome={expected_outcome}")
+
+
+class BridgeStallTests(unittest.TestCase):
+    def test_in_flight_request_is_visible_before_upstream_answers(self) -> None:
+        _StallingResponsesHandler.started = threading.Event()
+        _StallingResponsesHandler.release = threading.Event()
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _StallingResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(
+                upstream.server_port,
+                upstream_idle_timeout=30,
+            )
+            status_file = Path(temporary_policy.name) / "status.json"
+            try:
+                body = json.dumps(sample_payload()).encode("utf-8")
+                result: dict = {}
+
+                def call() -> None:
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1",
+                        server.server_port,
+                        timeout=30,
+                    )
+                    try:
+                        connection.request(
+                            "POST",
+                            "/v1/responses",
+                            body=body,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Content-Length": str(len(body)),
+                            },
+                        )
+                        response = connection.getresponse()
+                        result["status"] = response.status
+                        result["body"] = response.read()
+                    except OSError as exc:  # pragma: no cover - defensive
+                        result["error"] = exc
+                    finally:
+                        connection.close()
+
+                worker = threading.Thread(target=call, daemon=True)
+                worker.start()
+                self.assertTrue(
+                    _StallingResponsesHandler.started.wait(timeout=10),
+                    "upstream never received the forwarded request",
+                )
+
+                in_flight = None
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    payload = _read_status(status_file) or {}
+                    entries = payload.get("inFlight") or []
+                    if entries:
+                        in_flight = entries[0]
+                        break
+                    time.sleep(0.05)
+
+                self.assertIsNotNone(in_flight, "in-flight request was not recorded")
+                self.assertEqual(in_flight["requestPath"], "/v1/responses")
+                self.assertIn("startedAt", in_flight)
+                self.assertIn("targeted", in_flight)
+
+                _StallingResponsesHandler.release.set()
+                worker.join(timeout=30)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(result.get("status"), 200)
+
+                payload = _read_status(status_file) or {}
+                self.assertFalse(payload.get("inFlight"))
+                final = _wait_for_last_request(status_file, "completed")
+                self.assertEqual(final["upstreamStatus"], 200)
+            finally:
+                _StallingResponsesHandler.release.set()
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+    def test_upstream_silence_is_recorded_and_stream_is_terminated(self) -> None:
+        _StallingResponsesHandler.started = threading.Event()
+        _StallingResponsesHandler.release = threading.Event()
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _StallingResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(
+                upstream.server_port,
+                upstream_idle_timeout=1,
+            )
+            status_file = Path(temporary_policy.name) / "status.json"
+            try:
+                body = json.dumps(sample_payload()).encode("utf-8")
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=30,
+                )
+                started_at = time.time()
+                connection.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = connection.getresponse()
+                relayed = response.read()
+                elapsed = time.time() - started_at
+                connection.close()
+
+                self.assertEqual(response.status, 200)
+                self.assertIn(b'"type":"response.created"', relayed)
+                self.assertIn(b"upstream_stalled", relayed)
+                self.assertLess(elapsed, 20, "bridge waited for the stalled upstream")
+
+                last_request = _wait_for_last_request(
+                    status_file,
+                    "upstream-idle-timeout",
+                )
+                self.assertGreaterEqual(
+                    last_request["outcomeDetail"]["silenceSeconds"],
+                    1,
+                )
+            finally:
+                _StallingResponsesHandler.release.set()
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+    def test_upstream_header_timeout_is_recorded(self) -> None:
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _SilentResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(
+                upstream.server_port,
+                upstream_header_timeout=1,
+            )
+            status_file = Path(temporary_policy.name) / "status.json"
+            try:
+                body = json.dumps(sample_payload()).encode("utf-8")
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=30,
+                )
+                connection.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                connection.close()
+
+                self.assertEqual(response.status, 504)
+                last_request = _wait_for_last_request(
+                    status_file,
+                    "upstream-headers-timeout",
+                )
+                self.assertEqual(
+                    last_request["outcomeDetail"]["headerTimeoutSeconds"],
+                    1,
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+
+def start_bridge(
+    upstream_port: int,
+    upstream_header_timeout: int | None = None,
+    upstream_idle_timeout: int | None = None,
+):
+    from codex_cross_provider_bridge import (
+        DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
+        DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
+        create_server,
+    )
 
     temporary_policy = tempfile.TemporaryDirectory()
     server = create_server(
@@ -420,6 +688,16 @@ def start_bridge(upstream_port: int):
         upstream_url=f"http://127.0.0.1:{upstream_port}",
         policy_file=Path(temporary_policy.name) / "policy.json",
         status_file=Path(temporary_policy.name) / "status.json",
+        upstream_header_timeout=(
+            DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS
+            if upstream_header_timeout is None
+            else upstream_header_timeout
+        ),
+        upstream_idle_timeout=(
+            DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS
+            if upstream_idle_timeout is None
+            else upstream_idle_timeout
+        ),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

@@ -41,6 +41,8 @@ PORTABILITY_ERROR_MARKERS = (
     b"array too long",
 )
 MAX_BODY_BYTES = 256 * 1024 * 1024
+DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS = 120
+DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS = 120
 DEFAULT_STATE_DIRECTORY = Path(__file__).resolve().parents[1] / "state"
 DEFAULT_POLICY_FILE = DEFAULT_STATE_DIRECTORY / "policy.json"
 DEFAULT_STATUS_FILE = DEFAULT_STATE_DIRECTORY / "status.json"
@@ -71,6 +73,19 @@ def _write_json_atomic(path: Path, payload: object) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
     temporary.replace(path)
+
+
+def load_status_last_request(path: Path) -> object:
+    """Keep the previous request record visible after a bridge restart."""
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict):
+                return payload.get("lastRequest")
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
 
 
 def load_policy(path: Path) -> PolicyState:
@@ -358,9 +373,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
             else http.client.HTTPConnection
         )
         port = upstream.port or (443 if upstream.scheme == "https" else 80)
-        connection = connection_class(upstream.hostname, port, timeout=600)
+        header_timeout = self.server.upstream_header_timeout  # type: ignore[attr-defined]
+        connection = connection_class(
+            upstream.hostname,
+            port,
+            timeout=header_timeout or None,
+        )
         connection.request(method, path, body=body or None, headers=headers)
-        return connection.getresponse(), connection
+        # getresponse() clears connection.sock when the response closes the
+        # connection, so the socket has to be captured first to apply the
+        # idle timeout to the body reads.
+        upstream_socket = connection.sock
+        response = connection.getresponse()
+        idle_timeout = self.server.upstream_idle_timeout  # type: ignore[attr-defined]
+        if upstream_socket is not None:
+            upstream_socket.settimeout(idle_timeout or None)
+        return response, connection
 
     def _build_upstream_path(self) -> str:
         upstream = self.server.upstream  # type: ignore[attr-defined]
@@ -375,11 +403,45 @@ class BridgeHandler(BaseHTTPRequestHandler):
             path += separator + incoming.query
         return path or "/"
 
+    def _send_error_quietly(self, code: int, message: str) -> None:
+        try:
+            self.send_error(code, message)
+        except OSError:
+            pass
+
+    def _relay_failure_event(self, outcome: str, detail: dict[str, object]) -> None:
+        """Best-effort SSE error so a stalled stream is not an endless wait."""
+        message = (
+            "upstream produced no data for %ss"
+            % detail.get("silenceSeconds", "?")
+            if outcome == "upstream-idle-timeout"
+            else "upstream did not answer in time"
+        )
+        payload = json.dumps(
+            {
+                "type": "error",
+                "code": "upstream_stalled",
+                "message": (
+                    f"Cross-provider bridge aborted this request: {message}. "
+                    "The upstream provider never completed a response; retry or switch provider."
+                ),
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        try:
+            self.wfile.write(
+                b"event: error\ndata: " + payload + b"\n\n"
+            )
+            self.wfile.flush()
+        except OSError:
+            pass
+
     def _forward_response(
         self,
         response: http.client.HTTPResponse,
         buffered_body: bytes | None = None,
-    ) -> None:
+    ) -> tuple[str, dict[str, object]]:
+        content_type = (response.getheader("Content-Type") or "").lower()
         self.send_response(response.status, response.reason)
         for key, value in response.getheaders():
             lower = key.lower()
@@ -390,15 +452,88 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         if buffered_body is not None:
-            self.wfile.write(buffered_body)
-        else:
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
+            try:
+                self.wfile.write(buffered_body)
+            except OSError:
+                return "client-aborted", {"bytesRelayed": 0}
+            self.close_connection = True
+            return "completed", {"bytesRelayed": len(buffered_body)}
+
+        bytes_relayed = 0
+        silence_started = time.monotonic()
+        while True:
+            try:
+                # read1() returns as soon as any data is available; read() would
+                # block until the full block arrives and lose partial data when
+                # the idle timeout fires.
+                chunk = response.read1(65536)
+            except TimeoutError:
+                detail = {
+                    "silenceSeconds": round(time.monotonic() - silence_started, 3),
+                    "bytesRelayed": bytes_relayed,
+                }
+                if "event-stream" in content_type:
+                    self._relay_failure_event("upstream-idle-timeout", detail)
+                self.close_connection = True
+                return "upstream-idle-timeout", detail
+            except (OSError, http.client.HTTPException) as exc:
+                self.close_connection = True
+                return "upstream-error", {
+                    "error": type(exc).__name__,
+                    "bytesRelayed": bytes_relayed,
+                }
+            if not chunk:
+                self.close_connection = True
+                return "completed", {"bytesRelayed": bytes_relayed}
+            bytes_relayed += len(chunk)
+            silence_started = time.monotonic()
+            try:
                 self.wfile.write(chunk)
                 self.wfile.flush()
-        self.close_connection = True
+            except OSError:
+                self.close_connection = True
+                return "client-aborted", {"bytesRelayed": bytes_relayed}
+
+    def _publish_status(self) -> str:
+        """Rewrite the status file from current in-memory bridge state."""
+        server = self.server  # type: ignore[attr-defined]
+        with server.policy_lock:
+            policy = load_policy(server.policy_file)
+            _write_json_atomic(
+                server.status_file,
+                {
+                    "updatedAt": time.time(),
+                    "scope": policy.scope,
+                    "armed": policy.armed,
+                    "conversationIds": list(policy.conversation_ids),
+                    "targetConversationId": policy.target_conversation_id,
+                    "requestIndex": server.request_count,
+                    "inFlight": list(server.in_flight.values()) or None,
+                    "lastRequest": server.last_request,
+                },
+            )
+            return policy.scope
+
+    def _begin_request(self, descriptor: dict[str, object]) -> int:
+        """Record a request before it is forwarded so a stall stays visible."""
+        server = self.server  # type: ignore[attr-defined]
+        with server.policy_lock:
+            key = server.request_serial
+            server.request_serial += 1
+            server.in_flight[key] = descriptor
+        self._in_flight_key = key
+        self._publish_status()
+        return key
+
+    def _end_request(self, final_status: dict[str, object]) -> str:
+        server = self.server  # type: ignore[attr-defined]
+        key = getattr(self, "_in_flight_key", None)
+        with server.policy_lock:
+            if key is not None:
+                server.in_flight.pop(key, None)
+            server.last_request = final_status
+            server.request_count += 1
+        return self._publish_status()
 
     def _handle(self) -> None:
         if urlsplit(self.path).path == "/__bridge/info":
@@ -516,20 +651,58 @@ class BridgeHandler(BaseHTTPRequestHandler):
             request_headers["Content-Length"] = str(len(body))
         request_headers["Accept-Encoding"] = "identity"
 
+        repair_status = (
+            "repair-applied"
+            if targeted and needs_repair
+            else "not-needed"
+            if targeted
+            else "not-targeted"
+        )
+        request_descriptor: dict[str, object] = {
+            "conversationId": conversation_id,
+            "conversationIdSource": conversation_id_source,
+            "conversationTitle": conversation_title,
+            "cwd": conversation_cwd,
+            "modelProvider": conversation_provider,
+            "targeted": targeted,
+            "matchReason": match_reason,
+            "needsRepair": needs_repair,
+            "repairStatus": repair_status,
+            "requestPath": urlsplit(self.path).path,
+            "startedAt": time.time(),
+        }
+
         upstream_response: http.client.HTTPResponse | None = None
         connection: http.client.HTTPConnection | None = None
         buffered_body: bytes | None = None
         retried = False
         retry_report = SanitizeReport()
+        outcome = "upstream-error"
+        outcome_detail: dict[str, object] = {}
+        upstream_status: int | None = None
+
+        self._begin_request(request_descriptor)
 
         try:
             upstream_path = self._build_upstream_path()
-            upstream_response, connection = self._forward(
-                self.command,
-                upstream_path,
-                body,
-                request_headers,
-            )
+            try:
+                upstream_response, connection = self._forward(
+                    self.command,
+                    upstream_path,
+                    body,
+                    request_headers,
+                )
+            except TimeoutError:
+                outcome = "upstream-headers-timeout"
+                outcome_detail = {
+                    "headerTimeoutSeconds": self.server.upstream_header_timeout,  # type: ignore[attr-defined]
+                }
+                self._send_error_quietly(
+                    504,
+                    "Upstream did not send response headers before the bridge "
+                    "timeout. The provider may be stalled.",
+                )
+                return
 
             if (
                 original_payload is not None
@@ -557,54 +730,40 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 else:
                     buffered_body = first_error
 
-            self._forward_response(upstream_response, buffered_body)
-            repair_status = (
-                "repair-applied"
-                if targeted and needs_repair
-                else "not-needed"
-                if targeted
-                else "not-targeted"
+            outcome, outcome_detail = self._forward_response(
+                upstream_response,
+                buffered_body,
             )
-            with self.server.policy_lock:  # type: ignore[attr-defined]
-                current_policy = load_policy(self.server.policy_file)  # type: ignore[attr-defined]
-                request_index = self.server.request_count  # type: ignore[attr-defined]
-                self.server.request_count += 1  # type: ignore[attr-defined]
-                _write_json_atomic(
-                    self.server.status_file,  # type: ignore[attr-defined]
-                    {
-                        "updatedAt": time.time(),
-                        "scope": current_policy.scope,
-                        "armed": current_policy.armed,
-                        "conversationIds": list(current_policy.conversation_ids),
-                        "targetConversationId": current_policy.target_conversation_id,
-                        "requestIndex": request_index,
-                        "lastRequest": {
-                            "conversationId": conversation_id,
-                            "conversationIdSource": conversation_id_source,
-                            "conversationTitle": conversation_title,
-                            "cwd": conversation_cwd,
-                            "modelProvider": conversation_provider,
-                            "targeted": targeted,
-                            "matchReason": match_reason,
-                            "needsRepair": needs_repair,
-                            "repairStatus": repair_status,
-                            "removedItemIds": report.removed_item_ids,
-                            "removedEncryptedReasoning": report.removed_encrypted_reasoning,
-                            "portableRetry": retried,
-                            "upstreamStatus": upstream_response.status,
-                        },
-                    },
-                )
+            upstream_status = upstream_response.status
+        except (OSError, http.client.HTTPException) as exc:
+            outcome = "upstream-error"
+            outcome_detail = {"error": type(exc).__name__}
+            self._send_error_quietly(502, f"Upstream request failed: {exc}")
+        finally:
+            if connection is not None:
+                connection.close()
+            final_status = dict(request_descriptor)
+            final_status["outcome"] = outcome
+            final_status["upstreamStatus"] = upstream_status
+            final_status["portableRetry"] = retried
+            final_status["removedItemIds"] = report.removed_item_ids
+            final_status["removedEncryptedReasoning"] = (
+                report.removed_encrypted_reasoning
+            )
+            if outcome_detail:
+                final_status["outcomeDetail"] = outcome_detail
+            policy_scope = self._end_request(final_status)
             self.log_message(
-                "%s %s -> %s; scope=%s; targeted=%s; "
+                "%s %s -> %s; outcome=%s; scope=%s; targeted=%s; "
                 "conversation_id=%s; needs_repair=%s; removed_item_ids=%d; "
                 "removed_encrypted_reasoning=%d; "
                 "removed_previous_response_id=%s; portable_retry=%s; "
-                "omitted_provider_items=%d",
+                "omitted_provider_items=%d; detail=%s",
                 self.command,
                 urlsplit(self.path).path,
-                upstream_response.status,
-                current_policy.scope,
+                upstream_status if upstream_status is not None else "-",
+                outcome,
+                policy_scope,
                 str(targeted).lower(),
                 conversation_id or "-",
                 str(needs_repair).lower(),
@@ -613,12 +772,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 str(report.removed_previous_response_id).lower(),
                 str(retried).lower(),
                 retry_report.omitted_provider_items,
+                json.dumps(outcome_detail, ensure_ascii=False) if outcome_detail else "-",
             )
-        except (OSError, http.client.HTTPException) as exc:
-            self.send_error(502, f"Upstream request failed: {exc}")
-        finally:
-            if connection is not None:
-                connection.close()
 
     do_GET = _handle
     do_POST = _handle
@@ -640,6 +795,8 @@ class BridgeServer(ThreadingHTTPServer):
         policy_file: Path = DEFAULT_POLICY_FILE,
         status_file: Path = DEFAULT_STATUS_FILE,
         codex_home: Path = Path.home() / ".codex",
+        upstream_header_timeout: int = DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
+        upstream_idle_timeout: int = DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
     ) -> None:
         upstream = urlsplit(upstream_url)
         if upstream.scheme not in {"http", "https"} or not upstream.hostname:
@@ -651,9 +808,14 @@ class BridgeServer(ThreadingHTTPServer):
         self.policy_file = Path(policy_file)
         self.status_file = Path(status_file)
         self.codex_home = Path(codex_home)
+        self.upstream_header_timeout = max(0, int(upstream_header_timeout))
+        self.upstream_idle_timeout = max(0, int(upstream_idle_timeout))
         self.policy_lock = threading.Lock()
         self.metadata_cache: dict[str, tuple[float, dict[str, str]]] = {}
         self.request_count = 0
+        self.request_serial = 0
+        self.in_flight: dict[int, dict[str, object]] = {}
+        self.last_request: object = load_status_last_request(self.status_file)
 
 
 def create_server(
@@ -664,6 +826,8 @@ def create_server(
     policy_file: Path = DEFAULT_POLICY_FILE,
     status_file: Path = DEFAULT_STATUS_FILE,
     codex_home: Path = Path.home() / ".codex",
+    upstream_header_timeout: int = DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
+    upstream_idle_timeout: int = DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
 ) -> BridgeServer:
     if listen_host not in {"127.0.0.1", "::1", "localhost"}:
         raise ValueError("listen host must be loopback-only")
@@ -674,6 +838,8 @@ def create_server(
         policy_file=policy_file,
         status_file=status_file,
         codex_home=codex_home,
+        upstream_header_timeout=upstream_header_timeout,
+        upstream_idle_timeout=upstream_idle_timeout,
     )
 
 
@@ -687,6 +853,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-file", default=str(DEFAULT_POLICY_FILE))
     parser.add_argument("--status-file", default=str(DEFAULT_STATUS_FILE))
     parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument(
+        "--upstream-header-timeout",
+        type=int,
+        default=DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
+        help="Seconds to wait for upstream response headers; 0 disables the limit.",
+    )
+    parser.add_argument(
+        "--upstream-idle-timeout",
+        type=int,
+        default=DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
+        help="Seconds of upstream silence tolerated mid-stream; 0 disables the limit.",
+    )
     return parser.parse_args()
 
 
@@ -701,6 +879,8 @@ def main() -> int:
         policy_file=Path(args.policy_file),
         status_file=Path(args.status_file),
         codex_home=Path(args.codex_home),
+        upstream_header_timeout=args.upstream_header_timeout,
+        upstream_idle_timeout=args.upstream_idle_timeout,
     )
 
     def stop(_signum: int, _frame: object) -> None:
@@ -712,6 +892,10 @@ def main() -> int:
 
     print(f"Codex cross-provider bridge listening on http://{args.listen}")
     print(f"Forwarding to {args.upstream}")
+    print(
+        "Upstream limits: headers=%ss idle=%ss (0 disables)"
+        % (server.upstream_header_timeout, server.upstream_idle_timeout)
+    )
     if server.model_override:
         print(f"Rewriting request model to {server.model_override}")
     try:

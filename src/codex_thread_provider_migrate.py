@@ -11,7 +11,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from codex_history_audit import read_runtime_provider_ids
+from codex_history_audit import is_official_model, read_runtime_provider_ids
 
 
 def _load_thread(codex_home: Path, conversation_id: str) -> dict | None:
@@ -85,6 +85,13 @@ def _scan_rollout(rollout_path: str) -> dict:
     }
 
 
+def _rollout_stamp(rollout_path: Path) -> tuple[int, int] | None:
+    if not rollout_path.exists():
+        return None
+    stat = rollout_path.stat()
+    return stat.st_size, stat.st_mtime_ns
+
+
 def plan_thread_provider_migration(
     codex_home: Path,
     conversation_id: str,
@@ -109,8 +116,7 @@ def plan_thread_provider_migration(
     remote_compact_risk = (
         current_provider == "openai"
         and bool(thread["model"])
-        and not thread["model"].startswith("gpt-")
-        and not thread["model"].startswith("codex")
+        and not is_official_model(thread["model"])
     )
 
     return {
@@ -136,7 +142,8 @@ def plan_thread_provider_migration(
 def _update_rollout(
     rollout_path: Path,
     target_provider: str,
-) -> tuple[int, int, float]:
+) -> tuple[int, int, float, tuple[int, int] | None]:
+    original_stamp = _rollout_stamp(rollout_path)
     original_mtime = rollout_path.stat().st_mtime
     temporary = rollout_path.with_suffix(rollout_path.suffix + f".{os.getpid()}.tmp")
     session_meta_updates = 0
@@ -176,15 +183,21 @@ def _update_rollout(
                     + "\n"
                 )
 
+    if _rollout_stamp(rollout_path) != original_stamp:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError("Conversation rollout changed during migration")
     temporary.replace(rollout_path)
     os.utime(rollout_path, (original_mtime, original_mtime))
-    return session_meta_updates, runtime_updates, original_mtime
+    return session_meta_updates, runtime_updates, original_mtime, _rollout_stamp(
+        rollout_path
+    )
 
 
 def apply_thread_provider_migration(
     codex_home: Path,
     conversation_id: str,
     target_provider: str,
+    min_idle_seconds: int = 0,
 ) -> dict:
     plan = plan_thread_provider_migration(
         codex_home=codex_home,
@@ -199,8 +212,19 @@ def apply_thread_provider_migration(
     thread = _load_thread(codex_home, conversation_id)
     assert thread is not None
     rollout_path = Path(thread["rolloutPath"])
+    if min_idle_seconds > 0:
+        age_seconds = time.time() - rollout_path.stat().st_mtime
+        if age_seconds < min_idle_seconds:
+            raise RuntimeError(
+                "Conversation is still active; deferring migration "
+                f"until it has been idle for {min_idle_seconds} seconds"
+            )
+    rollout_stamp_before = _rollout_stamp(rollout_path)
 
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    stamp = (
+        time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        + f"-{time.time_ns() % 1_000_000_000:09d}"
+    )
     backup_directory = (
         codex_home
         / "backups"
@@ -216,6 +240,9 @@ def apply_thread_provider_migration(
     source_database = codex_home / "state_5.sqlite"
     source_connection = sqlite3.connect(source_database)
     backup_connection = sqlite3.connect(database_backup)
+    rollout_modified = False
+    database_modified = False
+    modified_rollout_stamp: tuple[int, int] | None = None
     try:
         source_connection.backup(backup_connection)
     finally:
@@ -241,32 +268,67 @@ def apply_thread_provider_migration(
     )
 
     try:
-        session_meta_updates, runtime_updates, _ = _update_rollout(
+        current_thread = _load_thread(codex_home, conversation_id)
+        if (
+            current_thread is None
+            or current_thread["modelProvider"] != plan["currentProvider"]
+            or current_thread["model"] != plan["model"]
+            or Path(current_thread["rolloutPath"]) != rollout_path
+        ):
+            raise RuntimeError("Conversation state changed before migration")
+        if _rollout_stamp(rollout_path) != rollout_stamp_before:
+            raise RuntimeError("Conversation rollout changed before migration")
+
+        (
+            session_meta_updates,
+            runtime_updates,
+            _,
+            modified_rollout_stamp,
+        ) = _update_rollout(
             rollout_path,
             target_provider,
         )
+        rollout_modified = True
         connection = sqlite3.connect(source_database)
         try:
             connection.execute("begin immediate")
-            connection.execute(
-                "update threads set model_provider = ? where id = ?",
-                (target_provider, conversation_id),
+            updated = connection.execute(
+                "update threads set model_provider = ? "
+                "where id = ? and model_provider = ? and model = ?",
+                (
+                    target_provider,
+                    conversation_id,
+                    plan["currentProvider"],
+                    plan["model"],
+                ),
             )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    "Conversation database state changed before migration"
+                )
             connection.commit()
+            database_modified = True
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
-    except Exception:
-        shutil.copy2(rollout_backup, rollout_path)
-        source_connection = sqlite3.connect(source_database)
-        backup_connection = sqlite3.connect(database_backup)
-        try:
-            backup_connection.backup(source_connection)
-        finally:
-            backup_connection.close()
-            source_connection.close()
+    except Exception as exc:
+        if rollout_modified and _rollout_stamp(rollout_path) != modified_rollout_stamp:
+            raise RuntimeError(
+                "Conversation rollout changed after migration; no automatic "
+                f"restore was performed. Backup: {backup_directory}"
+            ) from exc
+        if rollout_modified:
+            shutil.copy2(rollout_backup, rollout_path)
+        if database_modified:
+            source_connection = sqlite3.connect(source_database)
+            backup_connection = sqlite3.connect(database_backup)
+            try:
+                backup_connection.backup(source_connection)
+            finally:
+                backup_connection.close()
+                source_connection.close()
         raise
 
     return {

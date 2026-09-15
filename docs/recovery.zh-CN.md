@@ -8,6 +8,7 @@
 
 - `pre-install`
 - `pre-repair`
+- `pre-migration`
 - `pre-restore`
 - `manual`
 
@@ -27,9 +28,71 @@
 2. 验证快照中的 TOML。
 3. 为当前状态创建 `pre-restore` 快照。
 4. 停止并移除当前 Bridge 计划任务。
-5. 原子恢复 `config.toml`。
-6. 如快照中存在计划任务 XML，则恢复该任务。
-7. 恢复失败时自动回写 `pre-restore` 快照中的配置。
+5. 撤销自动修复计划任务。
+6. 原子恢复 `config.toml`。
+7. 如快照中存在计划任务 XML，则恢复该任务。
+8. 恢复失败时自动回写 `pre-restore` 快照中的配置。
+
+自动修复任务控制器不保存用户数据；撤销任务不会删除快照、rollout 备份或 CC
+Switch 设置备份。单会话迁移的独立备份保存在：
+
+```text
+~/.codex/backups/codex-thread-provider-migrate/<conversation-id>-<timestamp>/
+```
+
+列出或恢复单会话迁移：
+
+```powershell
+.\scripts\Restore-CodexThreadProviderMigration.ps1 -List
+.\scripts\Restore-CodexThreadProviderMigration.ps1 `
+  -BackupDirectory "<migration-backup-directory>"
+.\scripts\Restore-CodexThreadProviderMigration.ps1 `
+  -BackupDirectory "<migration-backup-directory>" `
+  -Apply
+```
+
+恢复前会验证 manifest、rollout 与 SQLite 备份，并为当前状态再创建一份迁移备份。
+
+生命周期钩子安装/卸载前保存在：
+
+```text
+~/.codex/backups/codex-cross-provider-hooks/<timestamp>/
+```
+
+列出、预览或恢复：
+
+```powershell
+.\scripts\Manage-CodexCrossProviderBridge.ps1 -Action list-hook-backups
+.\scripts\Manage-CodexCrossProviderBridge.ps1 `
+  -Action restore-hook-backup `
+  -HookBackupDirectory "<backup-directory>"
+.\scripts\Manage-CodexCrossProviderBridge.ps1 `
+  -Action restore-hook-backup `
+  -HookBackupDirectory "<backup-directory>" `
+  -ApplyOperation
+```
+
+卸载只删除包含 `codex_lifecycle_hook.py` 标记的钩子组，不覆盖用户新增的其他
+钩子。恢复前还会为当前 `hooks.json` 状态再创建一份备份。
+
+生命周期策略写入前的 JSON 备份位于：
+
+```text
+state/lifecycle-policy-backups/
+state/policy-backups/
+```
+
+列出或恢复生命周期策略：
+
+```powershell
+.\scripts\Manage-CodexCrossProviderBridge.ps1 -Action list-policy-backups
+.\scripts\Manage-CodexCrossProviderBridge.ps1 `
+  -Action restore-policy-backup `
+  -PolicyBackupFile "<policy-backup-file>" `
+  -ApplyOperation
+```
+
+这两类文件不包含凭据。分支历史是追加记录，不通过删除原会话来“撤销”分支。
 
 默认恢复 `pre-install` 快照。其他快照可以通过 ID 指定。
 

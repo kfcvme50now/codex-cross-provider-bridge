@@ -2,6 +2,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $script:CodexBridgeTaskName = "CodexCrossProviderBridge"
+$script:CodexBridgeAutomationTaskName = "CodexCrossProviderBridgeAutoRepair"
 $script:CodexBridgeBackupRoot = if ($env:CODEX_BRIDGE_BACKUP_ROOT) {
     [System.IO.Path]::GetFullPath($env:CODEX_BRIDGE_BACKUP_ROOT)
 } else {
@@ -15,12 +16,34 @@ function Get-NormalizedPath {
     return [System.IO.Path]::GetFullPath($Path)
 }
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (Get-Command -Name Get-FileHash -ErrorAction SilentlyContinue) {
+        return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+    }
+
+    # Windows PowerShell can inherit a PowerShell 7 module path, where
+    # Get-FileHash is not defined; fall back to the .NET implementation.
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return [System.BitConverter]::ToString($sha.ComputeHash($stream)).Replace("-", "")
+        } finally {
+            $sha.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Get-FileHashOrNull {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return $null
     }
-    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+    return (Get-Sha256Hex -Path $Path)
 }
 
 function Write-Utf8NoBom {
