@@ -101,19 +101,25 @@ Codex 官方文档当前提供：
 `repair` 是默认值。`repair-and-probe` 会为每次命中的会话启动增加一次真实模型
 请求，建议只用于切换后验证窗口。
 
-## 切换后的首次请求修复
+## 切换后的启动与首次请求修复
 
 CC Switch 切换 provider 时会重写 `config.toml`，把 bridge 从请求路径里挤掉。
-`UserPromptSubmit` 钩子负责在**切换后的第一次请求**上恢复路由，因此不需要常驻
-后台任务：
+`SessionStart` 会先尝试恢复路由，`UserPromptSubmit` 再在**切换后的第一次请求**
+上兜底，因此不需要常驻后台任务：
 
 1. 提交提示词时钩子读取 `config.toml` 的活动路由；
-2. 路由已经指向 bridge 时不做任何事；
+2. 路由已经指向 bridge 时检查 15722 是否实际监听；若计划任务已退出则尝试启动；
 3. 路由指向 CC Switch 的 `127.0.0.1:15721/v1` 时，调用
    `Repair-Codex-CCSwitchProviderAlias.ps1`（先建 pre-repair 快照）恢复 bridge
    URL 与历史 provider 别名；
-4. 修复成功或失败都会阻止本次发送（`continue: false`），Codex 显示原因，重新
-   发送即可。官方 `openai`/GPT 路由不会被改写。
+4. `SessionStart` 修复不会阻止发送；若到了 `UserPromptSubmit` 才修复，成功或失败
+   都会阻止本次发送（`continue: false`），Codex 显示原因，重新发送即可；若 bridge
+   启动失败，也会阻止发送并把原因写入 lifecycle 状态。官方 `openai`/GPT 路由不会
+   被改写。
+
+Bridge 处理到含旧 Responses ID 或加密 reasoning 的跨 Provider 请求时，还会读取
+`state_5.sqlite` 中该线程的当前模型。如果预压缩请求仍携带旧 Provider 的模型名，
+Bridge 只对这类需要修复的请求同步模型；普通新请求保持原模型不变。
 
 `RouteRepairMode` 可选择：
 
@@ -133,9 +139,9 @@ state/lifecycle-events.jsonl     仅记录需要动作的事件，追加写入
 ### 安装形式
 
 钩子命令由安装器写入 `$CODEX_HOME/codex-lifecycle-hook.cmd`（Windows）或
-`.sh`（其他平台），`hooks.json` 只引用这个脚本路径。这样做的原因是：Codex 通过
-shell 执行钩子命令并把整条命令再包一层引号，`cmd.exe` 会剥掉外层引号并截断最后
-一个参数，多参数内联命令因此无法启动。脚本路径不受该行为影响。
+`.sh`（其他平台），`hooks.json` 只引用这个脚本路径，避免多参数内联命令的 Windows
+shell 转义问题。Windows 上该 wrapper 路径不能再给整条命令额外加引号；新版 Codex
+会把开头引号当成可执行文件名的一部分，导致状态提示出现但脚本没有启动。
 
 信任要求：
 

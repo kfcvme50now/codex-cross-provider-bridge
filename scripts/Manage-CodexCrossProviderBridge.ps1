@@ -1,4 +1,9 @@
 [CmdletBinding()]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    "PSReviewUnusedParameter",
+    "RouteRepairMode",
+    Justification = "Forwarded from script scope by lifecycle policy helper functions."
+)]
 param(
     [ValidateSet(
         "install",
@@ -96,6 +101,8 @@ $BranchWrapper = Join-Path $PSScriptRoot "Invoke-CodexBranchHandoff.ps1"
 $RepairScript = Join-Path $PSScriptRoot "Repair-Codex-CCSwitchProviderAlias.ps1"
 $AuditScript = Join-Path (Split-Path $PSScriptRoot -Parent) "src\codex_history_audit.py"
 $MigrateScript = Join-Path (Split-Path $PSScriptRoot -Parent) "src\codex_thread_provider_migrate.py"
+$TemplateGuardScript = Join-Path (Split-Path $PSScriptRoot -Parent) "src\codex_ccswitch_template_guard.py"
+$CcSwitchDatabase = Join-Path $env:USERPROFILE ".cc-switch\cc-switch.db"
 if (-not $ConfigPath) {
     $ConfigPath = Join-Path $CodexHome "config.toml"
 }
@@ -212,7 +219,10 @@ function Register-BridgeTask {
     )) + (' --policy-file "{0}" --status-file "{1}"' -f (
         $PolicyFile,
         $StatusFile
-    )) + (' --codex-home "{0}"' -f $CodexHome)
+    )) + (' --codex-home "{0}" --cc-switch-db "{1}"' -f (
+        $CodexHome,
+        $CcSwitchDatabase
+    ))
     $taskAction = New-ScheduledTaskAction `
         -Execute $python `
         -Argument $arguments `
@@ -584,6 +594,18 @@ function Repair-HistoricalProviderAlias {
                 throw "Historical compatibility provider is missing after repair: $providerId"
             }
         }
+        if (Test-Path -LiteralPath $CcSwitchDatabase -PathType Leaf) {
+            $python = Get-PythonPath
+            & $python $TemplateGuardScript `
+                --database $CcSwitchDatabase `
+                --bridge-url $BridgeUrl `
+                --apply
+            if ($LASTEXITCODE -ne 0) {
+                throw "CC Switch provider template guard failed"
+            }
+        } else {
+            Write-Output "cc_switch_template_guard=skipped_database_missing"
+        }
         return
     }
 
@@ -596,6 +618,16 @@ function Repair-HistoricalProviderAlias {
             -ConfigPath $ConfigPath `
             -LegacyProviderId $providerId `
             -BridgeUrl $BridgeUrl
+    }
+    if (Test-Path -LiteralPath $CcSwitchDatabase -PathType Leaf) {
+        $python = Get-PythonPath
+        & $python $TemplateGuardScript `
+            --database $CcSwitchDatabase `
+            --bridge-url $BridgeUrl `
+            --apply
+        if ($LASTEXITCODE -ne 0) {
+            throw "CC Switch provider template guard failed"
+        }
     }
 }
 
@@ -1015,6 +1047,10 @@ switch ($Action) {
             $lastUpstreamStatus = if ($lastRequest.PSObject.Properties["upstreamStatus"]) { $lastRequest.upstreamStatus } else { "" }
             $lastOutcome = if ($lastRequest.PSObject.Properties["outcome"]) { $lastRequest.outcome } else { "" }
             $lastRequestPath = if ($lastRequest.PSObject.Properties["requestPath"]) { $lastRequest.requestPath } else { "" }
+            $lastActiveProviderId = if ($lastRequest.PSObject.Properties["activeProviderId"]) { $lastRequest.activeProviderId } else { "" }
+            $lastErrorCategory = if ($lastRequest.PSObject.Properties["errorCategory"]) { $lastRequest.errorCategory } else { "" }
+            $lastRetrySuppressed = if ($lastRequest.PSObject.Properties["retrySuppressed"]) { $lastRequest.retrySuppressed } else { "" }
+            $lastCircuitOpenUntil = if ($lastRequest.PSObject.Properties["circuitOpenUntil"]) { $lastRequest.circuitOpenUntil } else { "" }
             Write-Output "last_conversation_id=$lastConversationId"
             Write-Output "last_conversation_title=$lastConversationTitle"
             Write-Output "last_conversation_cwd=$lastConversationCwd"
@@ -1024,6 +1060,10 @@ switch ($Action) {
             Write-Output "last_upstream_status=$lastUpstreamStatus"
             Write-Output "last_request_path=$lastRequestPath"
             Write-Output "last_request_outcome=$lastOutcome"
+            Write-Output "last_active_provider_id=$lastActiveProviderId"
+            Write-Output "last_error_category=$lastErrorCategory"
+            Write-Output "last_retry_suppressed=$lastRetrySuppressed"
+            Write-Output "last_circuit_open_until=$lastCircuitOpenUntil"
         } else {
             Write-Output "last_repair_status=no-request-recorded"
         }

@@ -16,11 +16,16 @@
 2. 历史会话可以打开，但继续聊天时返回 HTTP 400。
 3. 历史会话恢复后，远程压缩仍读取旧的 provider/model 组合而失败。
 
-默认运行路径不会修改已保存的历史消息或 CC Switch 的 Provider 数据库。它通过
+默认运行路径不会修改已保存的历史消息。`repair` 会在先备份 CC Switch SQLite
+数据库后，为每个 Codex provider 模板写入一个受标记管理的空闲历史别名；它通过
 两个层次处理兼容性：
 
 - 为历史会话仍引用的 Provider ID 提供本地别名。
 - 在请求离开本机前，清理无法跨 Provider 重放的 Responses 状态。
+
+模板保护会让官方 provider 保留 `custom -> bridge`，第三方 provider 保留
+`cc-switch-official -> bridge`。因此 CC Switch 后续重新投影 `config.toml` 时，不会
+再次删除打开历史会话所需的别名；当前 provider 的正常路由仍由 CC Switch 管理。
 
 对“远程压缩仍读取旧 provider”的历史会话，另有一个显式或自动迁移入口；它只在
 安全条件成立时更新 rollout provider 元数据和对应的 Codex SQLite 行，并在写入前
@@ -51,6 +56,13 @@ Codex
 Bridge 只处理内存中的请求副本。它不记录请求正文、Authorization、API Key 或
 用户消息。状态文件中可能包含会话标题和工作目录，因此 `state/` 与备份目录不应
 提交到公开仓库。
+
+Codex 当前会用 Zstandard 压缩部分 Responses 请求。安装或更新后先安装唯一的
+运行时依赖：
+
+```powershell
+python -m pip install -r .\requirements.txt
+```
 
 ## 问题复现
 
@@ -131,11 +143,18 @@ code: invalid_value
 
 本项目选择保留原始历史，只修改即将发出的请求副本。
 
-### 结论三：Provider 私有 reasoning 无法保证无损迁移
+### 结论三：优先复用同类 Provider 状态，再安全降级
 
 加密 reasoning 和 Provider 私有响应 ID 不是通用协议数据。跨 Provider 时，
 Bridge 会优先保证可见消息、助手消息、工具调用和工具结果的可用性，并放弃无法
 验证的隐藏 reasoning。
+
+但对明确允许的 CC Switch Provider（默认是 `default` 与
+`anyrouter-codex-gpt6`），Bridge 会先原样发送现有 ID、
+`previous_response_id` 与 `reasoning.encrypted_content`。只有上游明确返回可移植性
+错误时，才自动进行一次清理后的保守重放。因此，同一 Provider 能继续利用已有的
+加密 reasoning，跨 Provider 又不会因为私有状态永久失败。Bridge 始终只修改出站
+副本，不会删除 rollout 中已经保存的加密内容。
 
 这意味着：
 
@@ -223,11 +242,14 @@ Provider，而不必强制修改历史数据库。
 - 请求会被检查是否需要历史修复；
 - 当前会话 ID、标题、工作目录和 Provider 会写入状态文件；
 - Bridge 会记录命中的范围、是否需要修复、上游 HTTP 状态；
+- 对确实含跨 Provider 状态的请求，Bridge 会用该线程数据库里当前选中的模型替换
+  预压缩仍携带的旧模型名，避免把 `deepseek-flash` 一类旧模型发给当前官方 Provider；
 - 如果历史状态仍被上游拒绝，会自动进行一次更保守的无 reasoning 重放。
 
-### 请求清理规则
+### Provider 状态保留与请求清理规则
 
-Bridge 会修改请求副本：
+对 `default` 与 `anyrouter-codex-gpt6`，Bridge 首次请求保留 Provider 私有状态；
+若上游明确拒绝，再对第二次请求副本执行以下清理：
 
 - 删除 `input[].id`
 - 删除 `previous_response_id`
@@ -235,6 +257,10 @@ Bridge 会修改请求副本：
 - 清空不可移植的 reasoning 文本
 - 强制 `store=false`
 - 必要时删除 reasoning 与 item reference
+
+其他 Provider 或无法读取 CC Switch 当前 Provider 时，仍采用“先清理、必要时再做
+更保守重放”的兼容路径。可用重复的 `--preserve-state-provider <provider-id>` 参数
+自定义保留名单。
 
 以下内容会保留：
 
@@ -251,15 +277,51 @@ Bridge 会修改请求副本：
 转发期间记录并在必要时中止这种请求：
 
 - 请求转发前先写入在途记录（`inFlight`），因此卡住时状态文件不再是空的；
+- 支持 Codex 当前使用的 `Content-Encoding: zstd`（以及 gzip），解压后才做 JSON
+  修复；未知编码返回结构化 HTTP 400，不再用会触发 Codex 连续重试的 415；
 - 超过首包阈值（`--upstream-header-timeout`，默认 120 秒）没有响应头时，返回
   504 并记录 `upstream-headers-timeout`；
 - 超过空闲阈值（`--upstream-idle-timeout`，默认 120 秒）没有任何响应数据时，
   向 SSE 流写入一个 `error` 事件后关闭连接，并记录 `upstream-idle-timeout`；
 - 客户端提前断开时记录 `client-aborted`。
 
+此外，Bridge 会只读检查 CC Switch 的当前 Provider 元数据：
+
+- `meta.routing_disabled=true` 时直接返回 HTTP 424，且不发送任何上游请求；
+- 默认对 `anyrouter-codex-gpt6` 启用健康门禁；CC Switch 已标记不健康时直接返回
+  HTTP 424；
+- AnyRouter 在健康状态过时的情况下返回 4xx/5xx、空成功响应、连接异常或流中途
+  终止时，Bridge 会输出结构化错误并打开默认 60 秒的本地短路；短路期间请求继续
+  返回 424，不会静默退出或不断撞击上游；
+- 状态文件记录 `activeProviderId`、`errorCategory`、`retrySuppressed` 与
+  `circuitOpenUntil`，不记录响应正文或凭据。
+
+健康门禁与短路名单可用重复的 `--health-guard-provider <provider-id>` 参数配置，
+短路时长可用 `--provider-circuit-seconds` 调整。OpenCode Go 当前仅在本机 CC Switch
+数据库中标记为“订阅过期、禁止路由”；它的 Provider 配置与凭据仍保留，以便以后
+恢复订阅后重新启用。
+
+通用、可逆的 Provider 声明工具不会读取或删除 `settings_config`。先预览，再应用：
+
+```powershell
+python .\src\codex_ccswitch_provider_policy.py `
+  --provider-id "<provider-id>" --disable --reason subscription_expired
+
+python .\src\codex_ccswitch_provider_policy.py `
+  --provider-id "<provider-id>" --disable --reason subscription_expired --apply
+```
+
+恢复订阅后只移除 Bridge 管理的禁用标记，不会自动把 Provider 设为当前项或放回
+故障转移队列：
+
+```powershell
+python .\src\codex_ccswitch_provider_policy.py `
+  --provider-id "<provider-id>" --enable --apply
+```
+
 阈值按实测留出余量：50 万 token 上下文、`reasoning.effort=high` 的正常请求，
 最长静默约 12 秒，整次请求约 20 秒。被中止的请求在 Codex 侧显示
-`stream disconnected before completion` 并触发自身重连，而不是无限等待。
+`stream disconnected before completion` 或明确的 Provider 错误，而不是无限等待。
 两个阈值都是秒数，设为 `0` 表示关闭该限制。修改后需要重启 Bridge 任务：
 
 ```powershell
@@ -392,6 +454,10 @@ last_repair_status
 last_upstream_status
 last_request_path
 last_request_outcome
+last_active_provider_id
+last_error_category
+last_retry_suppressed
+last_circuit_open_until
 in_flight_request_count
 conversation_history_found
 conversation_history_repair_required
@@ -405,6 +471,8 @@ conversation_missing_provider_ids
 - `last_repair_status=repair-applied` 表示 Bridge 已执行清理。
 - `last_repair_status=not-targeted` 表示请求不在当前范围内。
 - `last_repair_status=not-needed` 表示请求不需要清理。
+- `modelBefore` / `modelAfter`（位于 `state/status.json`）记录跨 Provider 请求是否把
+  旧模型同步为线程当前模型；普通请求不会改写模型。
 - `last_request_outcome` 表示最后一次请求如何结束：
 
 ```text
@@ -528,9 +596,12 @@ Codex 支持 `PreCompact` / `SessionStart` / `UserPromptSubmit` 生命周期钩�
 2. 迁移持久化 provider/model；
 3. 继续、停止或创建新分支。
 
-以及在下一次提示词提交时（切换 provider 后的第一次请求）检查活动路由：如果
+以及在 `SessionStart` 和下一次提示词提交时检查活动路由：如果
 `config.toml` 已经被 CC Switch 重写、bridge 被挤出请求路径，就按 `RouteRepairMode`
-修复并阻止本次发送，重新发送即可。这条路径不需要常驻后台任务。
+修复。启动阶段修复不会阻止发送；提示词阶段的兜底修复会阻止本次发送，重新发送
+即可。路由已经指向 bridge 时，钩子还会检查 15722 是否实际监听；若计划任务已退出，
+会先尝试启动，启动失败则阻止本次消息，避免把请求发到一个不存在的本地端口。这条
+路径不需要额外的轮询式后台修复任务。
 
 默认自动分支关闭。推荐先使用“修复后停止”，避免在当前 turn 已捕获旧 provider
 的边界条件下继续发送远程压缩：
@@ -552,8 +623,9 @@ pwsh .\scripts\Manage-CodexCrossProviderBridge.ps1 `
 ```
 
 钩子命令由安装器写入 `$CODEX_HOME/codex-lifecycle-hook.cmd`，`hooks.json` 只引用
-这个脚本：Codex 会通过 shell 执行钩子命令并再包一层引号，多参数内联命令会被
-`cmd.exe` 截断而启动失败。首次请求修复的行为、记录位置与信任要求见
+这个脚本。Windows 上引用不含空格的 wrapper 路径时不能再给整条命令额外加引号；
+新版 Codex 会把开头引号当成可执行文件名的一部分，使界面显示钩子状态但脚本未启动。
+首次请求修复的行为、记录位置与信任要求见
 [`docs/lifecycle-hooks.zh-CN.md`](docs/lifecycle-hooks.zh-CN.md)。
 
 如果希望将风险会话复制为一个新的兼容 thread，而不是继续原 thread，可以显式
@@ -759,11 +831,13 @@ PowerShell 脚本请使用 PowerShell 7（`pwsh`）。在 Windows PowerShell 5.1
 - `all / next / conversation` 范围
 - `input[].id` 清理
 - encrypted reasoning 清理
+- allowlist Provider 的 encrypted reasoning 首次保留与拒绝后降级
 - `previous_response_id` 清理
 - 保守重试
 - 流式转发
 - 在途请求记录
 - 上游首包超时与停滞中止
+- Provider 禁用/不健康预检、空响应、异常状态与本地短路
 - legacy `/responses/compact` 清理
 - 远程压缩 provider/model 风险检测
 - 单会话 provider 状态迁移与备份
@@ -781,8 +855,9 @@ PowerShell 脚本请使用 PowerShell 7（`pwsh`）。在 Windows PowerShell 5.1
 
 ## 已知限制
 
-- 未启用自动修复时，CC Switch 切换 Provider 后可能再次覆写 `config.toml`，
-  需要重新执行 `repair`。
+- `repair` 会把历史别名写入现有 CC Switch provider 模板；之后新增的 provider 仍需
+  再执行一次 `repair`。若生命周期钩子未受信任，活动第三方路由被重新投影后仍可能
+  暂时绕过 Bridge。
 - 历史线程如果仍以 `openai` provider 搭配第三方模型运行，可执行单会话迁移或
   启用自动修复；自动修复默认跳过当前会话并等待空闲阈值。
 - 历史会话修复不等于跨 Provider 的隐藏 reasoning 无损迁移。
@@ -798,6 +873,16 @@ PowerShell 脚本请使用 PowerShell 7（`pwsh`）。在 Windows PowerShell 5.1
 - 不同 Provider 的协议、模型、工具 schema 和上下文窗口仍可能不兼容。
 - 当前实现只在有限环境中验证，不能替代完整的跨平台和全 Provider 测试。
 - 不建议将 Bridge 监听地址暴露到局域网或公网。
+
+## 动态路由评估
+
+CC Switch 3.20.3 支持路由服务运行期间热切换当前 Provider，无需重启 Codex；但其
+Provider 选择仍是“每个应用一个全局当前 Provider”，不是按每条请求中的模型、
+推理强度或会话选择 Provider。并发请求前反复修改全局当前 Provider 会产生串线
+竞态，因此本项目不采用这种方式模拟动态路由。
+
+可行的请求级路由、按会话固定路由、仅对子代理切换模型的方案，以及现有项目对比
+见 [`docs/dynamic-routing.zh-CN.md`](docs/dynamic-routing.zh-CN.md)。
 
 ## 非 Provider 类问题
 

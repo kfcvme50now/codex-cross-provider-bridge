@@ -9,7 +9,9 @@ files or Codex databases.
 from __future__ import annotations
 
 import argparse
+import gzip
 import http.client
+import io
 import json
 import os
 import signal
@@ -21,6 +23,11 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+
+try:
+    import zstandard
+except ImportError:  # pragma: no cover - exercised only on incomplete installs
+    zstandard = None
 
 
 HOP_BY_HOP = {
@@ -43,9 +50,13 @@ PORTABILITY_ERROR_MARKERS = (
 MAX_BODY_BYTES = 256 * 1024 * 1024
 DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS = 120
 DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS = 120
+DEFAULT_PROVIDER_CIRCUIT_SECONDS = 60
 DEFAULT_STATE_DIRECTORY = Path(__file__).resolve().parents[1] / "state"
 DEFAULT_POLICY_FILE = DEFAULT_STATE_DIRECTORY / "policy.json"
 DEFAULT_STATUS_FILE = DEFAULT_STATE_DIRECTORY / "status.json"
+DEFAULT_CC_SWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
+DEFAULT_PRESERVE_STATE_PROVIDER_IDS = ("default", "anyrouter-codex-gpt6")
+DEFAULT_HEALTH_GUARD_PROVIDER_IDS = ("anyrouter-codex-gpt6",)
 
 
 @dataclass
@@ -64,6 +75,118 @@ class PolicyState:
     armed: bool = True
     target_conversation_id: str = ""
     updated_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class ProviderRuntimeState:
+    provider_id: str
+    name: str
+    is_healthy: bool | None
+    consecutive_failures: int
+    routing_disabled: bool
+    routing_disabled_reason: str
+
+
+class RequestBodyDecodeError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def decode_request_body(body: bytes, content_encoding: str) -> bytes:
+    encoding = content_encoding.lower().strip()
+    if not encoding or encoding == "identity":
+        return body
+    try:
+        if encoding == "zstd":
+            if zstandard is None:
+                raise RequestBodyDecodeError(
+                    "request_decompression_unavailable",
+                    "zstd request support is unavailable; install the zstandard package",
+                )
+            decoded = zstandard.ZstdDecompressor().decompress(
+                body,
+                max_output_size=MAX_BODY_BYTES + 1,
+            )
+        elif encoding == "gzip":
+            with gzip.GzipFile(fileobj=io.BytesIO(body), mode="rb") as stream:
+                decoded = stream.read(MAX_BODY_BYTES + 1)
+        else:
+            raise RequestBodyDecodeError(
+                "unsupported_content_encoding",
+                f"unsupported request Content-Encoding: {encoding}",
+            )
+    except RequestBodyDecodeError:
+        raise
+    except Exception as exc:  # zstd and gzip expose different decode exceptions
+        raise RequestBodyDecodeError(
+            "invalid_compressed_request",
+            f"could not decode {encoding} request body",
+        ) from exc
+    if len(decoded) > MAX_BODY_BYTES:
+        raise RequestBodyDecodeError(
+            "decompressed_request_too_large",
+            "decompressed request body exceeds the bridge limit",
+        )
+    return decoded
+
+
+def lookup_current_provider(database: Path) -> ProviderRuntimeState | None:
+    """Read only non-secret routing and health metadata from CC Switch."""
+    if not database.exists():
+        return None
+    try:
+        connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "select p.id, p.name, p.meta, h.is_healthy, "
+                "coalesce(h.consecutive_failures, 0) "
+                "from providers p left join provider_health h "
+                "on h.provider_id = p.id and h.app_type = p.app_type "
+                "where p.app_type = 'codex' and p.is_current = 1 limit 1"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        meta = json.loads(row[2] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    health = None if row[3] is None else bool(row[3])
+    return ProviderRuntimeState(
+        provider_id=str(row[0] or ""),
+        name=str(row[1] or row[0] or ""),
+        is_healthy=health,
+        consecutive_failures=int(row[4] or 0),
+        routing_disabled=bool(meta.get("routing_disabled", False)),
+        routing_disabled_reason=str(meta.get("routing_disabled_reason") or ""),
+    )
+
+
+def provider_block_reason(
+    provider: ProviderRuntimeState | None,
+    health_guard_provider_ids: set[str] | frozenset[str],
+) -> tuple[str, str] | None:
+    if provider is None:
+        return None
+    if provider.routing_disabled:
+        reason = provider.routing_disabled_reason or "disabled by local routing policy"
+        return "provider_disabled", reason
+    if (
+        provider.provider_id in health_guard_provider_ids
+        and provider.is_healthy is False
+    ):
+        return (
+            "provider_unavailable",
+            f"CC Switch marked this provider unhealthy after "
+            f"{provider.consecutive_failures} consecutive failures",
+        )
+    return None
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
@@ -149,10 +272,10 @@ def lookup_conversation_metadata(
     conversation_id: str,
 ) -> dict[str, str]:
     if not conversation_id:
-        return {"title": "", "cwd": "", "modelProvider": ""}
+        return {"title": "", "cwd": "", "modelProvider": "", "model": ""}
     database = codex_home / "state_5.sqlite"
     if not database.exists():
-        return {"title": "", "cwd": "", "modelProvider": ""}
+        return {"title": "", "cwd": "", "modelProvider": "", "model": ""}
 
     try:
         connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
@@ -161,28 +284,31 @@ def lookup_conversation_metadata(
                 row[1] for row in connection.execute("pragma table_info(threads)")
             }
             if "id" not in columns:
-                return {"title": "", "cwd": "", "modelProvider": ""}
+                return {"title": "", "cwd": "", "modelProvider": "", "model": ""}
             title_expression = "title" if "title" in columns else "''"
             cwd_expression = "cwd" if "cwd" in columns else "''"
             provider_expression = (
                 "model_provider" if "model_provider" in columns else "''"
             )
+            model_expression = "model" if "model" in columns else "''"
             row = connection.execute(
                 f"select {title_expression}, {cwd_expression}, "
-                f"{provider_expression} from threads where id = ?",
+                f"{provider_expression}, {model_expression} "
+                "from threads where id = ?",
                 (conversation_id,),
             ).fetchone()
             if not row:
-                return {"title": "", "cwd": "", "modelProvider": ""}
+                return {"title": "", "cwd": "", "modelProvider": "", "model": ""}
             return {
                 "title": str(row[0] or ""),
                 "cwd": str(row[1] or ""),
                 "modelProvider": str(row[2] or ""),
+                "model": str(row[3] or ""),
             }
         finally:
             connection.close()
     except sqlite3.Error:
-        return {"title": "", "cwd": "", "modelProvider": ""}
+        return {"title": "", "cwd": "", "modelProvider": "", "model": ""}
 
 
 def payload_needs_repair(payload: object) -> bool:
@@ -379,12 +505,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
             port,
             timeout=header_timeout or None,
         )
-        connection.request(method, path, body=body or None, headers=headers)
-        # getresponse() clears connection.sock when the response closes the
-        # connection, so the socket has to be captured first to apply the
-        # idle timeout to the body reads.
-        upstream_socket = connection.sock
-        response = connection.getresponse()
+        try:
+            connection.request(method, path, body=body or None, headers=headers)
+            # getresponse() clears connection.sock when the response closes the
+            # connection, so the socket has to be captured first to apply the
+            # idle timeout to the body reads.
+            upstream_socket = connection.sock
+            response = connection.getresponse()
+        except (OSError, http.client.HTTPException):
+            connection.close()
+            raise
         idle_timeout = self.server.upstream_idle_timeout  # type: ignore[attr-defined]
         if upstream_socket is not None:
             upstream_socket.settimeout(idle_timeout or None)
@@ -409,18 +539,41 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _send_json_error(self, status: int, code: str, message: str) -> None:
+        body = json.dumps(
+            {"error": {"code": code, "message": message}},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+        except OSError:
+            pass
+        self.close_connection = True
+
     def _relay_failure_event(self, outcome: str, detail: dict[str, object]) -> None:
         """Best-effort SSE error so a stalled stream is not an endless wait."""
-        message = (
-            "upstream produced no data for %ss"
-            % detail.get("silenceSeconds", "?")
-            if outcome == "upstream-idle-timeout"
-            else "upstream did not answer in time"
-        )
+        if outcome == "upstream-idle-timeout":
+            code = "upstream_stalled"
+            message = "upstream produced no data for %ss" % detail.get(
+                "silenceSeconds", "?"
+            )
+        elif outcome == "upstream-empty-response":
+            code = "upstream_empty_response"
+            message = "upstream closed a successful stream without any events"
+        else:
+            code = "upstream_terminated"
+            message = "upstream ended the stream unexpectedly"
         payload = json.dumps(
             {
                 "type": "error",
-                "code": "upstream_stalled",
+                "code": code,
                 "message": (
                     f"Cross-provider bridge aborted this request: {message}. "
                     "The upstream provider never completed a response; retry or switch provider."
@@ -477,12 +630,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return "upstream-idle-timeout", detail
             except (OSError, http.client.HTTPException) as exc:
-                self.close_connection = True
-                return "upstream-error", {
+                detail = {
                     "error": type(exc).__name__,
                     "bytesRelayed": bytes_relayed,
                 }
+                if "event-stream" in content_type:
+                    self._relay_failure_event("upstream-error", detail)
+                self.close_connection = True
+                return "upstream-error", detail
             if not chunk:
+                if bytes_relayed == 0 and "event-stream" in content_type:
+                    detail = {"bytesRelayed": 0}
+                    self._relay_failure_event("upstream-empty-response", detail)
+                    self.close_connection = True
+                    return "upstream-empty-response", detail
                 self.close_connection = True
                 return "completed", {"bytesRelayed": bytes_relayed}
             bytes_relayed += len(chunk)
@@ -576,12 +737,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
 
         content_encoding = (self.headers.get("Content-Encoding") or "").lower().strip()
-        if content_encoding and content_encoding != "identity":
-            self.send_error(
-                415,
-                "Compressed request body is unsupported. "
-                "Set [features] enable_request_compression = false in config.toml.",
-            )
+        try:
+            body = decode_request_body(body, content_encoding)
+        except RequestBodyDecodeError as exc:
+            self._send_json_error(400, exc.code, str(exc))
             return
 
         original_payload: object | None = None
@@ -592,10 +751,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
         conversation_title = ""
         conversation_cwd = ""
         conversation_provider = ""
+        conversation_model = ""
+        model_before = ""
+        model_after = ""
         needs_repair = False
         targeted = True
         match_reason = "non-responses"
         content_type = (self.headers.get("Content-Type") or "").lower()
+        active_provider = lookup_current_provider(
+            self.server.cc_switch_db  # type: ignore[attr-defined]
+        )
+        provider_state_preserved = False
 
         if body and "json" in content_type and _is_responses_path(self.path):
             try:
@@ -604,8 +770,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self.headers,
                     original_payload,
                 )
+                needs_repair = payload_needs_repair(original_payload)
                 cached = self.server.metadata_cache.get(conversation_id)  # type: ignore[attr-defined]
-                if not cached or time.time() - cached[0] > 10:
+                if needs_repair or not cached or time.time() - cached[0] > 10:
                     metadata = lookup_conversation_metadata(
                         self.server.codex_home,  # type: ignore[attr-defined]
                         conversation_id,
@@ -615,18 +782,34 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 conversation_title = cached[1]["title"]
                 conversation_cwd = cached[1]["cwd"]
                 conversation_provider = cached[1]["modelProvider"]
-                needs_repair = payload_needs_repair(original_payload)
+                conversation_model = cached[1]["model"]
                 with self.server.policy_lock:  # type: ignore[attr-defined]
                     policy = load_policy(self.server.policy_file)  # type: ignore[attr-defined]
                     targeted, match_reason = decide_scope(policy, conversation_id)
                     save_policy(self.server.policy_file, policy)  # type: ignore[attr-defined]
 
                 if targeted:
+                    if isinstance(original_payload, dict):
+                        model_before = str(original_payload.get("model") or "")
+                    effective_model_override = self.server.model_override  # type: ignore[attr-defined]
+                    if not effective_model_override and needs_repair:
+                        effective_model_override = conversation_model
                     original_payload = override_model(
                         original_payload,
-                        self.server.model_override,  # type: ignore[attr-defined]
+                        effective_model_override,
                     )
-                    sanitized_payload, report = sanitize_payload(original_payload)
+                    if isinstance(original_payload, dict):
+                        model_after = str(original_payload.get("model") or "")
+                    preserve_ids = self.server.preserve_state_provider_ids  # type: ignore[attr-defined]
+                    provider_state_preserved = bool(
+                        needs_repair
+                        and active_provider is not None
+                        and active_provider.provider_id in preserve_ids
+                    )
+                    if provider_state_preserved:
+                        sanitized_payload = original_payload
+                    else:
+                        sanitized_payload, report = sanitize_payload(original_payload)
                     body = json.dumps(
                         sanitized_payload,
                         ensure_ascii=False,
@@ -652,7 +835,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         request_headers["Accept-Encoding"] = "identity"
 
         repair_status = (
-            "repair-applied"
+            "provider-state-preserved"
+            if provider_state_preserved
+            else "repair-applied"
             if targeted and needs_repair
             else "not-needed"
             if targeted
@@ -664,13 +849,63 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "conversationTitle": conversation_title,
             "cwd": conversation_cwd,
             "modelProvider": conversation_provider,
+            "conversationModel": conversation_model,
+            "modelBefore": model_before,
+            "modelAfter": model_after,
             "targeted": targeted,
             "matchReason": match_reason,
             "needsRepair": needs_repair,
             "repairStatus": repair_status,
+            "activeProviderId": active_provider.provider_id if active_provider else "",
+            "activeProviderName": active_provider.name if active_provider else "",
             "requestPath": urlsplit(self.path).path,
             "startedAt": time.time(),
         }
+
+        blocked = provider_block_reason(
+            active_provider,
+            self.server.health_guard_provider_ids,  # type: ignore[attr-defined]
+        )
+        circuit: dict[str, object] | None = None
+        if active_provider is not None:
+            circuit = self.server.get_open_provider_circuit(  # type: ignore[attr-defined]
+                active_provider.provider_id
+            )
+        if blocked is None and circuit is not None:
+            blocked = (
+                "provider_circuit_open",
+                "the local circuit is open after an unexpected upstream failure",
+            )
+        if blocked is not None:
+            code, reason = blocked
+            request_descriptor["outcome"] = "provider-blocked"
+            request_descriptor["retrySuppressed"] = True
+            request_descriptor["errorCategory"] = code
+            request_descriptor["outcomeDetail"] = {
+                "reason": reason,
+                "consecutiveFailures": (
+                    active_provider.consecutive_failures if active_provider else 0
+                ),
+            }
+            if circuit is not None:
+                request_descriptor["circuitOpenUntil"] = circuit["openUntil"]
+            self._begin_request(request_descriptor)
+            self._send_json_error(
+                424,
+                code,
+                f"Request stopped locally: provider "
+                f"{active_provider.name if active_provider else 'unknown'} is unavailable "
+                f"({reason}). No upstream request was sent.",
+            )
+            self._end_request(request_descriptor)
+            self.log_message(
+                "%s %s -> 424; outcome=provider-blocked; provider=%s; category=%s",
+                self.command,
+                urlsplit(self.path).path,
+                active_provider.provider_id if active_provider else "-",
+                code,
+            )
+            return
 
         upstream_response: http.client.HTTPResponse | None = None
         connection: http.client.HTTPConnection | None = None
@@ -697,11 +932,30 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 outcome_detail = {
                     "headerTimeoutSeconds": self.server.upstream_header_timeout,  # type: ignore[attr-defined]
                 }
-                self._send_error_quietly(
-                    504,
-                    "Upstream did not send response headers before the bridge "
-                    "timeout. The provider may be stalled.",
-                )
+                if (
+                    active_provider is not None
+                    and active_provider.provider_id
+                    in self.server.health_guard_provider_ids  # type: ignore[attr-defined]
+                ):
+                    circuit = self.server.open_provider_circuit(  # type: ignore[attr-defined]
+                        active_provider.provider_id,
+                        "upstream-headers-timeout",
+                    )
+                    outcome = "provider-upstream-error"
+                    outcome_detail["circuitOpenUntil"] = circuit["openUntil"]
+                    self._send_json_error(
+                        424,
+                        "provider_upstream_error",
+                        "Request stopped: the provider did not answer before the "
+                        "header timeout. The local circuit is now open; no automatic "
+                        "upstream retry will be attempted.",
+                    )
+                else:
+                    self._send_error_quietly(
+                        504,
+                        "Upstream did not send response headers before the bridge "
+                        "timeout. The provider may be stalled.",
+                    )
                 return
 
             if (
@@ -730,15 +984,99 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 else:
                     buffered_body = first_error
 
+            guarded_provider = bool(
+                active_provider is not None
+                and active_provider.provider_id
+                in self.server.health_guard_provider_ids  # type: ignore[attr-defined]
+            )
+            if guarded_provider and not 200 <= upstream_response.status < 300:
+                if buffered_body is None:
+                    buffered_body = upstream_response.read()
+                upstream_status = upstream_response.status
+                circuit = self.server.open_provider_circuit(  # type: ignore[attr-defined]
+                    active_provider.provider_id,
+                    f"upstream-http-{upstream_response.status}",
+                )
+                outcome = "provider-upstream-error"
+                outcome_detail = {
+                    "upstreamStatus": upstream_response.status,
+                    "circuitOpenUntil": circuit["openUntil"],
+                    "retrySuppressed": True,
+                }
+                self._send_json_error(
+                    424,
+                    "provider_upstream_error",
+                    f"Request stopped: provider {active_provider.name} returned "
+                    f"HTTP {upstream_response.status}. The local circuit is now open; "
+                    "no automatic upstream retry will be attempted.",
+                )
+                return
+
+            declared_length = (upstream_response.getheader("Content-Length") or "").strip()
+            if guarded_provider and (
+                upstream_response.status == 204 or declared_length == "0"
+            ):
+                upstream_status = upstream_response.status
+                circuit = self.server.open_provider_circuit(  # type: ignore[attr-defined]
+                    active_provider.provider_id,
+                    "upstream-empty-response",
+                )
+                outcome = "provider-upstream-error"
+                outcome_detail = {
+                    "upstreamStatus": upstream_response.status,
+                    "emptyResponse": True,
+                    "circuitOpenUntil": circuit["openUntil"],
+                    "retrySuppressed": True,
+                }
+                self._send_json_error(
+                    424,
+                    "provider_empty_response",
+                    f"Request stopped: provider {active_provider.name} returned an "
+                    "empty success response. The local circuit is now open; no "
+                    "automatic upstream retry will be attempted.",
+                )
+                return
+
             outcome, outcome_detail = self._forward_response(
                 upstream_response,
                 buffered_body,
             )
             upstream_status = upstream_response.status
+            if guarded_provider and outcome in {
+                "upstream-idle-timeout",
+                "upstream-error",
+                "upstream-empty-response",
+            }:
+                circuit = self.server.open_provider_circuit(  # type: ignore[attr-defined]
+                    active_provider.provider_id,
+                    outcome,
+                )
+                outcome_detail["circuitOpenUntil"] = circuit["openUntil"]
+                outcome_detail["retrySuppressed"] = True
         except (OSError, http.client.HTTPException) as exc:
-            outcome = "upstream-error"
+            guarded_provider = bool(
+                active_provider is not None
+                and active_provider.provider_id
+                in self.server.health_guard_provider_ids  # type: ignore[attr-defined]
+            )
+            outcome = "provider-upstream-error" if guarded_provider else "upstream-error"
             outcome_detail = {"error": type(exc).__name__}
-            self._send_error_quietly(502, f"Upstream request failed: {exc}")
+            if guarded_provider:
+                circuit = self.server.open_provider_circuit(  # type: ignore[attr-defined]
+                    active_provider.provider_id,
+                    type(exc).__name__,
+                )
+                outcome_detail["circuitOpenUntil"] = circuit["openUntil"]
+                outcome_detail["retrySuppressed"] = True
+                self._send_json_error(
+                    424,
+                    "provider_upstream_error",
+                    f"Request stopped: provider {active_provider.name} ended the "
+                    "connection unexpectedly. The local circuit is now open; no "
+                    "automatic upstream retry will be attempted.",
+                )
+            else:
+                self._send_error_quietly(502, f"Upstream request failed: {exc}")
         finally:
             if connection is not None:
                 connection.close()
@@ -750,6 +1088,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
             final_status["removedEncryptedReasoning"] = (
                 report.removed_encrypted_reasoning
             )
+            if outcome == "provider-upstream-error" or outcome_detail.get(
+                "retrySuppressed"
+            ):
+                final_status["errorCategory"] = "provider_upstream_error"
+                final_status["retrySuppressed"] = True
+            if outcome_detail.get("circuitOpenUntil") is not None:
+                final_status["circuitOpenUntil"] = outcome_detail["circuitOpenUntil"]
             if outcome_detail:
                 final_status["outcomeDetail"] = outcome_detail
             policy_scope = self._end_request(final_status)
@@ -795,6 +1140,10 @@ class BridgeServer(ThreadingHTTPServer):
         policy_file: Path = DEFAULT_POLICY_FILE,
         status_file: Path = DEFAULT_STATUS_FILE,
         codex_home: Path = Path.home() / ".codex",
+        cc_switch_db: Path = DEFAULT_CC_SWITCH_DB,
+        preserve_state_provider_ids: tuple[str, ...] = DEFAULT_PRESERVE_STATE_PROVIDER_IDS,
+        health_guard_provider_ids: tuple[str, ...] = DEFAULT_HEALTH_GUARD_PROVIDER_IDS,
+        provider_circuit_seconds: int = DEFAULT_PROVIDER_CIRCUIT_SECONDS,
         upstream_header_timeout: int = DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
         upstream_idle_timeout: int = DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
     ) -> None:
@@ -808,6 +1157,12 @@ class BridgeServer(ThreadingHTTPServer):
         self.policy_file = Path(policy_file)
         self.status_file = Path(status_file)
         self.codex_home = Path(codex_home)
+        self.cc_switch_db = Path(cc_switch_db)
+        self.preserve_state_provider_ids = frozenset(preserve_state_provider_ids)
+        self.health_guard_provider_ids = frozenset(health_guard_provider_ids)
+        self.provider_circuit_seconds = max(1, int(provider_circuit_seconds))
+        self.provider_circuit_lock = threading.Lock()
+        self.provider_circuits: dict[str, dict[str, object]] = {}
         self.upstream_header_timeout = max(0, int(upstream_header_timeout))
         self.upstream_idle_timeout = max(0, int(upstream_idle_timeout))
         self.policy_lock = threading.Lock()
@@ -816,6 +1171,31 @@ class BridgeServer(ThreadingHTTPServer):
         self.request_serial = 0
         self.in_flight: dict[int, dict[str, object]] = {}
         self.last_request: object = load_status_last_request(self.status_file)
+
+    def get_open_provider_circuit(self, provider_id: str) -> dict[str, object] | None:
+        now = time.time()
+        with self.provider_circuit_lock:
+            circuit = self.provider_circuits.get(provider_id)
+            if circuit is None:
+                return None
+            if float(circuit.get("openUntil") or 0) <= now:
+                self.provider_circuits.pop(provider_id, None)
+                return None
+            return dict(circuit)
+
+    def open_provider_circuit(
+        self,
+        provider_id: str,
+        reason: str,
+    ) -> dict[str, object]:
+        circuit = {
+            "reason": reason,
+            "openedAt": time.time(),
+            "openUntil": time.time() + self.provider_circuit_seconds,
+        }
+        with self.provider_circuit_lock:
+            self.provider_circuits[provider_id] = circuit
+        return dict(circuit)
 
 
 def create_server(
@@ -826,6 +1206,10 @@ def create_server(
     policy_file: Path = DEFAULT_POLICY_FILE,
     status_file: Path = DEFAULT_STATUS_FILE,
     codex_home: Path = Path.home() / ".codex",
+    cc_switch_db: Path = DEFAULT_CC_SWITCH_DB,
+    preserve_state_provider_ids: tuple[str, ...] = DEFAULT_PRESERVE_STATE_PROVIDER_IDS,
+    health_guard_provider_ids: tuple[str, ...] = DEFAULT_HEALTH_GUARD_PROVIDER_IDS,
+    provider_circuit_seconds: int = DEFAULT_PROVIDER_CIRCUIT_SECONDS,
     upstream_header_timeout: int = DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
     upstream_idle_timeout: int = DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
 ) -> BridgeServer:
@@ -838,6 +1222,10 @@ def create_server(
         policy_file=policy_file,
         status_file=status_file,
         codex_home=codex_home,
+        cc_switch_db=cc_switch_db,
+        preserve_state_provider_ids=preserve_state_provider_ids,
+        health_guard_provider_ids=health_guard_provider_ids,
+        provider_circuit_seconds=provider_circuit_seconds,
         upstream_header_timeout=upstream_header_timeout,
         upstream_idle_timeout=upstream_idle_timeout,
     )
@@ -853,6 +1241,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-file", default=str(DEFAULT_POLICY_FILE))
     parser.add_argument("--status-file", default=str(DEFAULT_STATUS_FILE))
     parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--cc-switch-db", default=str(DEFAULT_CC_SWITCH_DB))
+    parser.add_argument(
+        "--preserve-state-provider",
+        action="append",
+        dest="preserve_state_providers",
+        help=(
+            "CC Switch provider ID allowed to try existing provider-owned state first. "
+            "Repeat for multiple providers."
+        ),
+    )
+    parser.add_argument(
+        "--health-guard-provider",
+        action="append",
+        dest="health_guard_providers",
+        help=(
+            "CC Switch provider ID blocked locally while its health state is unhealthy. "
+            "Repeat for multiple providers."
+        ),
+    )
+    parser.add_argument(
+        "--provider-circuit-seconds",
+        type=int,
+        default=DEFAULT_PROVIDER_CIRCUIT_SECONDS,
+        help="Seconds to suppress guarded-provider retries after an upstream failure.",
+    )
     parser.add_argument(
         "--upstream-header-timeout",
         type=int,
@@ -879,6 +1292,14 @@ def main() -> int:
         policy_file=Path(args.policy_file),
         status_file=Path(args.status_file),
         codex_home=Path(args.codex_home),
+        cc_switch_db=Path(args.cc_switch_db),
+        preserve_state_provider_ids=tuple(
+            args.preserve_state_providers or DEFAULT_PRESERVE_STATE_PROVIDER_IDS
+        ),
+        health_guard_provider_ids=tuple(
+            args.health_guard_providers or DEFAULT_HEALTH_GUARD_PROVIDER_IDS
+        ),
+        provider_circuit_seconds=args.provider_circuit_seconds,
         upstream_header_timeout=args.upstream_header_timeout,
         upstream_idle_timeout=args.upstream_idle_timeout,
     )

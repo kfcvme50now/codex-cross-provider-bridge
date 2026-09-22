@@ -133,10 +133,10 @@ def wrapper_script_path(codex_home: Path) -> Path:
 def write_wrapper_script(path: Path, command: str) -> None:
     """Point Codex at a script instead of an inline command line.
 
-    Codex runs hook commands through the shell and wraps the string in quotes;
-    cmd.exe then strips the outer quotes of a multi-argument command line and
-    mangles the final argument, which makes hooks fail to start. A single script
-    path survives that handling.
+    A single script path avoids shell quoting of the multi-argument Python
+    command. The hook definition leaves that path unquoted because Codex's
+    Windows hook launcher treats a leading quote as part of the executable
+    name. The managed wrapper path itself never contains spaces.
     """
     if path.suffix == ".cmd":
         content = "@echo off\r\n" + command + "\r\n"
@@ -323,7 +323,7 @@ def install_lifecycle_hooks(
         bridge_url=bridge_url,
     )
     wrapper_path = wrapper_script_path(codex_home)
-    command = _quote_command_part(wrapper_path)
+    command = str(wrapper_path)
     installed = _is_installed(payload)
     if installed and _is_current_install(payload, command):
         return {

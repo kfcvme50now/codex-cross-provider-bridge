@@ -70,7 +70,7 @@ class HookManagerTests(unittest.TestCase):
             self.assertEqual(len(hooks["hooks"]["UserPromptSubmit"]), 1)
             wrapper_path = wrapper_script_path(codex_home)
             prompt_command = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-            self.assertEqual(prompt_command, f'"{wrapper_path}"')
+            self.assertEqual(prompt_command, str(wrapper_path))
             wrapper_text = wrapper_path.read_text(encoding="utf-8")
             self.assertIn("--route-repair-script", wrapper_text)
             self.assertIn("http://127.0.0.1:15722/v1", wrapper_text)

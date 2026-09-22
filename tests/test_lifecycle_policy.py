@@ -347,6 +347,52 @@ class LifecyclePolicyTests(unittest.TestCase):
             self.assertEqual(status["result"], "repaired-and-verified")
             self.assertTrue(status["probe"]["ok"])
 
+    def test_session_start_repairs_cc_switch_route_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_home, config, conversation_id = write_fixture(root)
+            write_route_config(config, provider="custom", base_url=CC_SWITCH_URL)
+            status_path = root / "lifecycle-status.json"
+            calls: list[tuple[Path, str]] = []
+
+            def fake_route_repair(target: Path, bridge_url: str) -> dict:
+                calls.append((target, bridge_url))
+                write_route_config(target, provider="custom", base_url=bridge_url)
+                return {"ok": True, "status": "repaired"}
+
+            result = run_session_start_hook(
+                event={
+                    "session_id": conversation_id,
+                    "hook_event_name": "SessionStart",
+                    "source": "resume",
+                    "cwd": str(root),
+                    "model": "deepseek-flash",
+                },
+                policy={
+                    "compactRepairMode": "repair-and-stop",
+                    "autoBranchEnabled": False,
+                    "branchBackend": "app-server",
+                    "postSwitchProbeMode": "disabled",
+                    "postSwitchScope": "preserve",
+                    "sessionStartMode": "repair",
+                    "routeRepairMode": "repair",
+                    "probeTimeoutSeconds": 30,
+                },
+                codex_home=codex_home,
+                config_path=config,
+                status_path=status_path,
+                apply=True,
+                bridge_url=BRIDGE_URL,
+                route_repair_runner=fake_route_repair,
+            )
+
+            self.assertTrue(result["continue"])
+            self.assertEqual(calls, [(config, BRIDGE_URL)])
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["routeRepairResult"], "repaired")
+            self.assertEqual(status["routeBefore"], CC_SWITCH_URL)
+            self.assertEqual(status["routeAfter"], BRIDGE_URL)
+
 
 BRIDGE_URL = "http://127.0.0.1:15722/v1"
 CC_SWITCH_URL = "http://127.0.0.1:15721/v1"
@@ -378,6 +424,7 @@ class RouteRepairHookTests(unittest.TestCase):
         config_path: Path,
         policy: dict | None = None,
         runner=None,
+        bridge_ensure_runner=None,
         apply: bool = True,
     ) -> tuple[dict, Path, Path]:
         status_path = root / "state" / "lifecycle-status.json"
@@ -397,6 +444,7 @@ class RouteRepairHookTests(unittest.TestCase):
             apply=apply,
             bridge_url=BRIDGE_URL,
             route_repair_runner=runner,
+            bridge_ensure_runner=bridge_ensure_runner,
         )
         return result, status_path, status_path.parent / "lifecycle-events.jsonl"
 
@@ -458,6 +506,54 @@ class RouteRepairHookTests(unittest.TestCase):
                 runner=unreachable_runner,
             )
             self.assertTrue(disabled["continue"])
+
+    def test_bridged_route_starts_missing_bridge_before_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            write_route_config(config_path, base_url=BRIDGE_URL)
+            calls: list[str] = []
+
+            def fake_bridge_ensure(bridge_url: str) -> dict:
+                calls.append(bridge_url)
+                return {"ok": True, "status": "started"}
+
+            result, status_path, _ = self._run(
+                root,
+                config_path,
+                bridge_ensure_runner=fake_bridge_ensure,
+            )
+
+            self.assertTrue(result["continue"])
+            self.assertEqual(calls, [BRIDGE_URL])
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["result"], "route-ok")
+            self.assertEqual(status["bridgeEnsure"]["status"], "started")
+
+    def test_missing_bridge_blocks_prompt_when_restart_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            write_route_config(config_path, base_url=BRIDGE_URL)
+
+            def failing_bridge_ensure(_bridge_url: str) -> dict:
+                return {
+                    "ok": False,
+                    "status": "start-failed",
+                    "error": "scheduled task did not open the port",
+                }
+
+            result, status_path, events_path = self._run(
+                root,
+                config_path,
+                bridge_ensure_runner=failing_bridge_ensure,
+            )
+
+            self.assertFalse(result["continue"])
+            self.assertIn("scheduled task did not open the port", result["stopReason"])
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["result"], "bridge-start-failed")
+            self.assertTrue(events_path.exists())
 
     def test_official_route_is_never_rewritten(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

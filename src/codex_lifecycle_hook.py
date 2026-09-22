@@ -8,11 +8,13 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from codex_branch_handoff import run_branch_handoff
 from codex_config_guard import inspect_config_route
@@ -30,6 +32,7 @@ from codex_thread_provider_migrate import apply_thread_provider_migration
 BranchRunner = Callable[..., dict]
 ProbeRunner = Callable[..., dict]
 RouteRepairRunner = Callable[[Path, str], dict]
+BridgeEnsureRunner = Callable[[str], dict]
 
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:15722/v1"
 ROUTE_REPAIR_TIMEOUT_SECONDS = 180
@@ -236,9 +239,76 @@ def run_session_start_hook(
     status_path: Path,
     apply: bool,
     probe_runner: ProbeRunner | None = None,
+    bridge_url: str = "",
+    route_repair_script: Path | None = None,
+    route_repair_runner: RouteRepairRunner | None = None,
+    bridge_ensure_runner: BridgeEnsureRunner | None = None,
 ) -> dict:
     normalized = _normalize_policy(policy)
     session_id = str(event.get("session_id") or "").strip()
+    target_url = (bridge_url or DEFAULT_BRIDGE_URL).rstrip("/")
+    route_before = ""
+    route_after = ""
+    route_repair_result = "not-required"
+    route_repair_error = ""
+    bridge_ensure_result: dict = {}
+
+    try:
+        route = inspect_config_route(config_path)
+        route_before = str(route.get("baseUrl") or "").rstrip("/")
+        route_after = route_before
+        if normalized["routeRepairMode"] == "disabled":
+            route_repair_result = "disabled"
+        elif route_before == target_url:
+            route_repair_result = "route-ok"
+        elif not route.get("eligibleForAutomaticBridgeRepair"):
+            route_repair_result = "route-not-applicable"
+        elif normalized["routeRepairMode"] == "inspect" or not apply:
+            route_repair_result = "repair-planned"
+        else:
+            runner = route_repair_runner or (
+                lambda config, bridge: run_configured_route_repair(
+                    config,
+                    bridge,
+                    route_repair_script,
+                )
+            )
+            repair = runner(config_path, target_url)
+            if repair.get("ok"):
+                route_repair_result = "repaired"
+                route_after = target_url
+            else:
+                route_repair_result = "repair-failed"
+                route_repair_error = str(
+                    repair.get("error")
+                    or repair.get("status")
+                    or "unknown failure"
+                )
+    except Exception as exc:  # noqa: BLE001 - startup must remain recoverable
+        route_repair_result = "repair-failed"
+        route_repair_error = str(exc)
+
+    if (
+        apply
+        and route_after == target_url
+        and normalized["routeRepairMode"] != "disabled"
+        and (bridge_ensure_runner is not None or route_repair_script is not None)
+    ):
+        ensure_runner = bridge_ensure_runner or (
+            lambda bridge: run_configured_bridge_ensure(
+                bridge,
+                route_repair_script,
+            )
+        )
+        bridge_ensure_result = ensure_runner(target_url)
+        if not bridge_ensure_result.get("ok"):
+            route_repair_result = "bridge-start-failed"
+            route_repair_error = str(
+                bridge_ensure_result.get("error")
+                or bridge_ensure_result.get("status")
+                or "unknown failure"
+            )
+
     decision = decide_compact_action(
         codex_home=codex_home,
         config_path=config_path,
@@ -315,6 +385,16 @@ def run_session_start_hook(
             "Provider compatibility metadata could not be repaired. "
             "Compaction may fail if this session uses a third-party model."
         )
+    if route_repair_result == "repaired":
+        additional_context = (
+            "The cross-provider bridge route was restored for this session. "
+            + additional_context
+        ).strip()
+    elif route_repair_result in {"repair-failed", "bridge-start-failed"}:
+        additional_context = (
+            "The cross-provider bridge route could not be restored: "
+            f"{route_repair_error}. " + additional_context
+        ).strip()
     output = {
         "continue": True,
         "systemMessage": _short_summary(decision, result_status),
@@ -335,6 +415,12 @@ def run_session_start_hook(
             "reason": decision.get("reason", ""),
             "result": result_status,
             "error": error,
+            "routeRepairResult": route_repair_result,
+            "routeRepairError": route_repair_error,
+            "routeBefore": route_before,
+            "routeAfter": route_after,
+            "bridgeUrl": target_url,
+            "bridgeEnsure": bridge_ensure_result,
             "migrationBackupDirectory": (
                 migration_result or {}
             ).get("backupDirectory", ""),
@@ -406,6 +492,99 @@ def run_configured_route_repair(
     }
 
 
+def _bridge_endpoint(bridge_url: str) -> tuple[str, int]:
+    parsed = urlsplit(bridge_url)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise ValueError("bridge URL must use loopback HTTP")
+    if parsed.port is None:
+        raise ValueError("bridge URL must include a port")
+    return parsed.hostname, parsed.port
+
+
+def _bridge_is_listening(bridge_url: str, timeout: float = 0.25) -> bool:
+    host, port = _bridge_endpoint(bridge_url)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def run_configured_bridge_ensure(
+    bridge_url: str,
+    route_repair_script: Path | None,
+) -> dict:
+    """Start the managed bridge task when its configured loopback port is down."""
+    try:
+        if _bridge_is_listening(bridge_url):
+            return {"ok": True, "status": "already-running"}
+    except ValueError as exc:
+        return {"ok": False, "status": "invalid-bridge-url", "error": str(exc)}
+
+    manager = (
+        route_repair_script.parent / "Manage-CodexCrossProviderBridge.ps1"
+        if route_repair_script is not None
+        else None
+    )
+    if manager is None or not manager.is_file():
+        return {
+            "ok": False,
+            "status": "bridge-manager-missing",
+            "error": f"bridge manager not found: {manager}",
+        }
+    executable = (
+        shutil.which("pwsh.exe")
+        or shutil.which("pwsh")
+        or shutil.which("powershell.exe")
+    )
+    if not executable:
+        return {
+            "ok": False,
+            "status": "powershell-missing",
+            "error": "pwsh or powershell was not found on PATH",
+        }
+    try:
+        completed = subprocess.run(
+            [
+                executable,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(manager),
+                "-Action",
+                "start",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "status": "start-error", "error": str(exc)}
+    if completed.returncode != 0:
+        return {
+            "ok": False,
+            "status": "start-failed",
+            "exitCode": completed.returncode,
+            "error": (completed.stderr or completed.stdout or "").strip()[:400],
+        }
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if _bridge_is_listening(bridge_url):
+            return {"ok": True, "status": "started"}
+        time.sleep(0.1)
+    return {
+        "ok": False,
+        "status": "start-timeout",
+        "error": "scheduled task did not open the bridge port within 5 seconds",
+    }
+
+
 def run_user_prompt_submit_hook(
     event: dict,
     policy: dict,
@@ -416,6 +595,7 @@ def run_user_prompt_submit_hook(
     bridge_url: str = "",
     route_repair_script: Path | None = None,
     route_repair_runner: RouteRepairRunner | None = None,
+    bridge_ensure_runner: BridgeEnsureRunner | None = None,
 ) -> dict:
     """Keep the bridge in the request path when CC Switch rewrote config.toml.
 
@@ -434,6 +614,7 @@ def run_user_prompt_submit_hook(
     route_after = ""
     provider = ""
     repair_result: dict = {}
+    bridge_ensure_result: dict = {}
 
     try:
         route = inspect_config_route(config_path)
@@ -481,6 +662,34 @@ def run_user_prompt_submit_hook(
                     or "unknown failure"
                 )
 
+    if (
+        apply
+        and route_after == target_url
+        and mode != "disabled"
+        and (bridge_ensure_runner is not None or route_repair_script is not None)
+    ):
+        ensure_runner = bridge_ensure_runner or (
+            lambda bridge: run_configured_bridge_ensure(
+                bridge,
+                route_repair_script,
+            )
+        )
+        try:
+            bridge_ensure_result = ensure_runner(target_url)
+        except Exception as exc:  # noqa: BLE001 - hook must block safely
+            bridge_ensure_result = {
+                "ok": False,
+                "status": "runner-error",
+                "error": str(exc),
+            }
+        if not bridge_ensure_result.get("ok"):
+            result_status = "bridge-start-failed"
+            error = str(
+                bridge_ensure_result.get("error")
+                or bridge_ensure_result.get("status")
+                or "unknown failure"
+            )
+
     if result_status == "repaired":
         output = {
             "continue": False,
@@ -493,14 +702,14 @@ def run_user_prompt_submit_hook(
                 "The message was not sent; resend it."
             ),
         }
-    elif result_status == "repair-failed":
+    elif result_status in {"repair-failed", "bridge-start-failed"}:
         output = {
             "continue": False,
             "stopReason": (
-                "Codex route repair failed, so this message was not sent to avoid "
-                f"bypassing the bridge: {error}"
+                "The cross-provider bridge is unavailable, so this message was not "
+                f"sent: {error}"
             ),
-            "systemMessage": "Route repair failed; see the lifecycle status log.",
+            "systemMessage": "Bridge recovery failed; see the lifecycle status log.",
         }
     elif result_status == "repair-planned":
         output = {
@@ -534,12 +743,14 @@ def run_user_prompt_submit_hook(
         "bridgeUrl": target_url,
         "error": error,
         "repair": repair_result,
+        "bridgeEnsure": bridge_ensure_result,
     }
     _write_json_atomic(status_path, recorded)
     if result_status in {
         "repair-planned",
         "repaired",
         "repair-failed",
+        "bridge-start-failed",
         "config-unreadable",
     }:
         _append_json_line(status_path.parent / "lifecycle-events.jsonl", recorded)
@@ -608,6 +819,12 @@ def main() -> int:
                 config_path=Path(args.config),
                 status_path=Path(args.status_file),
                 apply=args.apply,
+                bridge_url=args.bridge_url,
+                route_repair_script=(
+                    Path(args.route_repair_script)
+                    if args.route_repair_script
+                    else None
+                ),
             )
     except Exception as exc:  # noqa: BLE001 - a hook must not block the prompt
         sys.stderr.write(f"codex lifecycle hook failed: {exc}\n")

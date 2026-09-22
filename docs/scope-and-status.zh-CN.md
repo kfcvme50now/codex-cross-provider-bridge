@@ -4,8 +4,9 @@ Bridge 支持三种运行时范围。
 
 ## `all`
 
-所有 Requests 请求都经过清理。适合持续跨 provider 工作，但会关闭原 provider
-的隐藏 reasoning 复用。
+所有 Responses 请求都经过 Bridge 策略。`default` 与
+`anyrouter-codex-gpt6` 会先尝试保留原 Provider 的响应 ID 和加密 reasoning，只有
+明确遭到上游拒绝时才降级清理；其他 Provider 默认直接使用可移植请求副本。
 
 ## `next`
 
@@ -133,6 +134,10 @@ last_repair_status
 last_upstream_status
 last_request_path
 last_request_outcome
+last_active_provider_id
+last_error_category
+last_retry_suppressed
+last_circuit_open_until
 in_flight_request_count
 conversation_history_repair_required
 ```
@@ -147,7 +152,13 @@ conversation_history_repair_required
 - `last_request_path`：最后一次请求的路径（`/v1/responses` 或
   `/v1/responses/compact`）。
 - `last_request_outcome`：`completed`、`upstream-idle-timeout`、
-  `upstream-headers-timeout`、`client-aborted` 或 `upstream-error`。
+  `upstream-headers-timeout`、`upstream-empty-response`、`client-aborted`、
+  `upstream-error`、`provider-upstream-error` 或 `provider-blocked`。
+- `last_active_provider_id`：Bridge 从 CC Switch 数据库只读取得的当前 Provider ID。
+- `last_error_category`：例如 `provider_disabled`、`provider_unavailable`、
+  `provider_circuit_open` 或 `provider_upstream_error`。
+- `last_retry_suppressed`：是否已用本地 424/短路阻止继续撞击不可用 Provider。
+- `last_circuit_open_until`：本地短路的 Unix 时间戳；没有短路时为空。
 - `in_flight_request_count`：仍在转发中的请求数量；大于 0 时还会输出
   `in_flight_request=<path> started_at=<时间戳>`。
 

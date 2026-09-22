@@ -11,6 +11,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import zstandard
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from codex_cross_provider_bridge import (
@@ -199,7 +201,533 @@ class _MockResponsesHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class _AcceptingResponsesHandler(BaseHTTPRequestHandler):
+    requests: list[dict] = []
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        type(self).requests.append(payload)
+        body = b'{"type":"response.completed","response":{"output":[]}}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _FailingResponsesHandler(BaseHTTPRequestHandler):
+    requests = 0
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        type(self).requests += 1
+        body = b'{"error":{"message":"temporary upstream failure"}}'
+        self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _EmptyResponsesHandler(BaseHTTPRequestHandler):
+    requests = 0
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        type(self).requests += 1
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def _create_cc_switch_database(
+    root: Path,
+    provider_id: str,
+    *,
+    healthy: bool = True,
+    disabled: bool = False,
+) -> Path:
+    database = root / "cc-switch.db"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "create table providers ("
+        "id text, app_type text, name text, meta text, is_current integer"
+        ")"
+    )
+    connection.execute(
+        "create table provider_health ("
+        "provider_id text, app_type text, is_healthy integer, "
+        "consecutive_failures integer, last_success_at text, last_failure_at text"
+        ")"
+    )
+    meta = (
+        {"routing_disabled": True, "routing_disabled_reason": "subscription_expired"}
+        if disabled
+        else {}
+    )
+    connection.execute(
+        "insert into providers values (?, 'codex', ?, ?, 1)",
+        (provider_id, provider_id, json.dumps(meta)),
+    )
+    connection.execute(
+        "insert into provider_health values (?, 'codex', ?, ?, null, ?)",
+        (provider_id, int(healthy), 0 if healthy else 3, None if healthy else "now"),
+    )
+    connection.commit()
+    connection.close()
+    return database
+
+
 class BridgeIntegrationTests(unittest.TestCase):
+    def test_zstd_compressed_codex_request_is_decoded_before_rewrite(self) -> None:
+        _AcceptingResponsesHandler.requests = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _AcceptingResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(upstream.server_port)
+            try:
+                raw_body = json.dumps(sample_payload()).encode("utf-8")
+                body = zstandard.ZstdCompressor().compress(raw_body)
+                client = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_port, timeout=5
+                )
+                client.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Encoding": "zstd",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = client.getresponse()
+                response.read()
+                client.close()
+
+                self.assertEqual(response.status, 200)
+                self.assertEqual(len(_AcceptingResponsesHandler.requests), 1)
+                self.assertNotIn(
+                    "encrypted_content",
+                    next(
+                        item
+                        for item in _AcceptingResponsesHandler.requests[0]["input"]
+                        if item["type"] == "reasoning"
+                    ),
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+    def test_unknown_request_compression_returns_structured_400_without_forwarding(self) -> None:
+        _AcceptingResponsesHandler.requests = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _AcceptingResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(upstream.server_port)
+            try:
+                body = b"not-a-supported-frame"
+                client = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_port, timeout=5
+                )
+                client.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Encoding": "br",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = client.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                client.close()
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(
+                    payload["error"]["code"], "unsupported_content_encoding"
+                )
+                self.assertEqual(_AcceptingResponsesHandler.requests, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+    def test_allowlisted_provider_preserves_encrypted_reasoning_on_first_attempt(self) -> None:
+        _AcceptingResponsesHandler.requests = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _AcceptingResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cc_switch_db = _create_cc_switch_database(Path(directory), "default")
+            try:
+                server, bridge_thread, temporary_policy = start_bridge(
+                    upstream.server_port,
+                    cc_switch_db=cc_switch_db,
+                )
+                try:
+                    body = json.dumps(sample_payload()).encode("utf-8")
+                    client = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_port, timeout=5
+                    )
+                    client.request(
+                        "POST",
+                        "/v1/responses",
+                        body=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Content-Length": str(len(body)),
+                        },
+                    )
+                    response = client.getresponse()
+                    response.read()
+                    client.close()
+
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(len(_AcceptingResponsesHandler.requests), 1)
+                    forwarded = _AcceptingResponsesHandler.requests[0]
+                    self.assertEqual(
+                        forwarded["previous_response_id"],
+                        "resp_from_other_provider",
+                    )
+                    reasoning = next(
+                        item for item in forwarded["input"] if item["type"] == "reasoning"
+                    )
+                    self.assertEqual(reasoning["encrypted_content"], "opaque-ciphertext")
+
+                    status = json.loads(
+                        (Path(temporary_policy.name) / "status.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )["lastRequest"]
+                    self.assertEqual(status["activeProviderId"], "default")
+                    self.assertEqual(status["repairStatus"], "provider-state-preserved")
+                    self.assertEqual(status["removedEncryptedReasoning"], 0)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    bridge_thread.join(timeout=5)
+                    temporary_policy.cleanup()
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+
+    def test_unhealthy_anyrouter_is_stopped_before_upstream(self) -> None:
+        _AcceptingResponsesHandler.requests = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _AcceptingResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cc_switch_db = _create_cc_switch_database(
+                Path(directory), "anyrouter-codex-gpt6", healthy=False
+            )
+            try:
+                server, bridge_thread, temporary_policy = start_bridge(
+                    upstream.server_port,
+                    cc_switch_db=cc_switch_db,
+                )
+                try:
+                    body = json.dumps(sample_payload()).encode("utf-8")
+                    client = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_port, timeout=5
+                    )
+                    client.request(
+                        "POST",
+                        "/v1/responses",
+                        body=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Content-Length": str(len(body)),
+                        },
+                    )
+                    response = client.getresponse()
+                    response_body = json.loads(response.read().decode("utf-8"))
+                    client.close()
+
+                    self.assertEqual(response.status, 424)
+                    self.assertEqual(response_body["error"]["code"], "provider_unavailable")
+                    self.assertEqual(_AcceptingResponsesHandler.requests, [])
+                    last_request = _wait_for_last_request(
+                        Path(temporary_policy.name) / "status.json",
+                        "provider-blocked",
+                    )
+                    self.assertTrue(last_request["retrySuppressed"])
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    bridge_thread.join(timeout=5)
+                    temporary_policy.cleanup()
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+
+    def test_explicitly_disabled_provider_is_stopped_even_when_health_is_stale(self) -> None:
+        _AcceptingResponsesHandler.requests = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _AcceptingResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cc_switch_db = _create_cc_switch_database(
+                Path(directory), "opencodego-retained", healthy=True, disabled=True
+            )
+            try:
+                server, bridge_thread, temporary_policy = start_bridge(
+                    upstream.server_port,
+                    cc_switch_db=cc_switch_db,
+                )
+                try:
+                    body = json.dumps(sample_payload()).encode("utf-8")
+                    client = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_port, timeout=5
+                    )
+                    client.request(
+                        "POST",
+                        "/v1/responses",
+                        body=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Content-Length": str(len(body)),
+                        },
+                    )
+                    response = client.getresponse()
+                    response_body = json.loads(response.read().decode("utf-8"))
+                    client.close()
+
+                    self.assertEqual(response.status, 424)
+                    self.assertEqual(response_body["error"]["code"], "provider_disabled")
+                    self.assertEqual(_AcceptingResponsesHandler.requests, [])
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    bridge_thread.join(timeout=5)
+                    temporary_policy.cleanup()
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+
+    def test_anyrouter_failure_opens_local_circuit_and_suppresses_retry(self) -> None:
+        _FailingResponsesHandler.requests = 0
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _FailingResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cc_switch_db = _create_cc_switch_database(
+                Path(directory), "anyrouter-codex-gpt6", healthy=True
+            )
+            try:
+                server, bridge_thread, temporary_policy = start_bridge(
+                    upstream.server_port,
+                    cc_switch_db=cc_switch_db,
+                )
+                try:
+                    error_codes = []
+                    for _ in range(2):
+                        body = json.dumps(sample_payload()).encode("utf-8")
+                        client = http.client.HTTPConnection(
+                            "127.0.0.1", server.server_port, timeout=5
+                        )
+                        client.request(
+                            "POST",
+                            "/v1/responses",
+                            body=body,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Content-Length": str(len(body)),
+                            },
+                        )
+                        response = client.getresponse()
+                        payload = json.loads(response.read().decode("utf-8"))
+                        client.close()
+                        self.assertEqual(response.status, 424)
+                        error_codes.append(payload["error"]["code"])
+
+                    self.assertEqual(
+                        error_codes,
+                        ["provider_upstream_error", "provider_circuit_open"],
+                    )
+                    self.assertEqual(_FailingResponsesHandler.requests, 1)
+                    last_request = _wait_for_last_request(
+                        Path(temporary_policy.name) / "status.json",
+                        "provider-blocked",
+                    )
+                    self.assertIn("circuitOpenUntil", last_request)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    bridge_thread.join(timeout=5)
+                    temporary_policy.cleanup()
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+
+    def test_anyrouter_empty_success_is_reported_as_an_error(self) -> None:
+        _EmptyResponsesHandler.requests = 0
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _EmptyResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cc_switch_db = _create_cc_switch_database(
+                Path(directory), "anyrouter-codex-gpt6", healthy=True
+            )
+            try:
+                server, bridge_thread, temporary_policy = start_bridge(
+                    upstream.server_port,
+                    cc_switch_db=cc_switch_db,
+                )
+                try:
+                    body = json.dumps(sample_payload()).encode("utf-8")
+                    client = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_port, timeout=5
+                    )
+                    client.request(
+                        "POST",
+                        "/v1/responses",
+                        body=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Content-Length": str(len(body)),
+                        },
+                    )
+                    response = client.getresponse()
+                    payload = json.loads(response.read().decode("utf-8"))
+                    client.close()
+
+                    self.assertEqual(response.status, 424)
+                    self.assertEqual(payload["error"]["code"], "provider_empty_response")
+                    self.assertEqual(_EmptyResponsesHandler.requests, 1)
+                    last_request = _wait_for_last_request(
+                        Path(temporary_policy.name) / "status.json",
+                        "provider-upstream-error",
+                    )
+                    self.assertTrue(last_request["outcomeDetail"]["retrySuppressed"])
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    bridge_thread.join(timeout=5)
+                    temporary_policy.cleanup()
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+
+    def test_cross_provider_history_uses_the_threads_current_model(self) -> None:
+        _MockResponsesHandler.requests = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _MockResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory) / ".codex"
+            codex_home.mkdir()
+            connection = sqlite3.connect(codex_home / "state_5.sqlite")
+            connection.execute(
+                "create table threads ("
+                "id text primary key, model_provider text, model text, title text, "
+                "cwd text, rollout_path text"
+                ")"
+            )
+            connection.execute(
+                "insert into threads values (?, ?, ?, ?, ?, ?)",
+                (
+                    "conversation-model-switch",
+                    "custom",
+                    "gpt-5.6-sol",
+                    "Model switch",
+                    str(Path(directory)),
+                    str(Path(directory) / "rollout.jsonl"),
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            try:
+                server, bridge_thread, temporary_policy = start_bridge(
+                    upstream.server_port,
+                    codex_home=codex_home,
+                )
+                try:
+                    payload = sample_payload()
+                    payload["model"] = "deepseek-flash"
+                    payload["prompt_cache_key"] = "conversation-model-switch"
+                    body = json.dumps(payload).encode("utf-8")
+                    client = http.client.HTTPConnection(
+                        "127.0.0.1",
+                        server.server_port,
+                        timeout=5,
+                    )
+                    client.request(
+                        "POST",
+                        "/v1/responses",
+                        body=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Content-Length": str(len(body)),
+                        },
+                    )
+                    response = client.getresponse()
+                    response.read()
+                    client.close()
+
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(
+                        _MockResponsesHandler.requests[0]["model"],
+                        "gpt-5.6-sol",
+                    )
+                    status = json.loads(
+                        (Path(temporary_policy.name) / "status.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )["lastRequest"]
+                    self.assertEqual(status["modelBefore"], "deepseek-flash")
+                    self.assertEqual(status["modelAfter"], "gpt-5.6-sol")
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    bridge_thread.join(timeout=5)
+                    temporary_policy.cleanup()
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+
     def test_legacy_compact_endpoint_is_sanitized(self) -> None:
         _MockResponsesHandler.requests = []
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), _MockResponsesHandler)
@@ -674,6 +1202,8 @@ def start_bridge(
     upstream_port: int,
     upstream_header_timeout: int | None = None,
     upstream_idle_timeout: int | None = None,
+    codex_home: Path | None = None,
+    cc_switch_db: Path | None = None,
 ):
     from codex_cross_provider_bridge import (
         DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
@@ -688,6 +1218,8 @@ def start_bridge(
         upstream_url=f"http://127.0.0.1:{upstream_port}",
         policy_file=Path(temporary_policy.name) / "policy.json",
         status_file=Path(temporary_policy.name) / "status.json",
+        codex_home=codex_home or Path(temporary_policy.name) / ".codex",
+        cc_switch_db=cc_switch_db or Path(temporary_policy.name) / "cc-switch.db",
         upstream_header_timeout=(
             DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS
             if upstream_header_timeout is None
