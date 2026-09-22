@@ -4,6 +4,26 @@
     "RouteRepairMode",
     Justification = "Forwarded from script scope by lifecycle policy helper functions."
 )]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    "PSReviewUnusedParameter",
+    "ProviderRoute",
+    Justification = "Forwarded from script scope when the scheduled bridge task is registered."
+)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    "PSReviewUnusedParameter",
+    "ProviderRouteBearerEnv",
+    Justification = "Forwarded from script scope when the scheduled bridge task is registered."
+)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    "PSReviewUnusedParameter",
+    "ProviderMaxAttempts",
+    Justification = "Forwarded from script scope when the scheduled bridge task is registered."
+)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    "PSReviewUnusedParameter",
+    "ProviderRetryBackoffSeconds",
+    Justification = "Forwarded from script scope when the scheduled bridge task is registered."
+)]
 param(
     [ValidateSet(
         "install",
@@ -86,7 +106,13 @@ param(
     [string]$HookBackupDirectory = "",
     [string]$PolicyBackupFile = "",
     [string]$ConfigPath = "",
-    [string]$BridgeStateDirectory = ""
+    [string]$BridgeStateDirectory = "",
+    [string[]]$ProviderRoute = @(),
+    [string[]]$ProviderRouteBearerEnv = @(),
+    [ValidateRange(1, 10)]
+    [int]$ProviderMaxAttempts = 3,
+    [ValidateRange(0.0, 60.0)]
+    [double]$ProviderRetryBackoffSeconds = 0.5
 )
 
 . (Join-Path $PSScriptRoot "CodexCrossProviderBridge.Common.ps1")
@@ -222,7 +248,22 @@ function Register-BridgeTask {
     )) + (' --codex-home "{0}" --cc-switch-db "{1}"' -f (
         $CodexHome,
         $CcSwitchDatabase
+    )) + (' --provider-max-attempts {0} --provider-retry-backoff-seconds {1}' -f (
+        $ProviderMaxAttempts,
+        $ProviderRetryBackoffSeconds.ToString([Globalization.CultureInfo]::InvariantCulture)
     ))
+    foreach ($route in $ProviderRoute) {
+        if ($route.Contains('"')) {
+            throw 'ProviderRoute must not contain double quotes'
+        }
+        $arguments += ' --provider-route "{0}"' -f $route
+    }
+    foreach ($routeCredential in $ProviderRouteBearerEnv) {
+        if ($routeCredential.Contains('"')) {
+            throw 'ProviderRouteBearerEnv must not contain double quotes'
+        }
+        $arguments += ' --provider-route-bearer-env "{0}"' -f $routeCredential
+    }
     $taskAction = New-ScheduledTaskAction `
         -Execute $python `
         -Argument $arguments `
@@ -1051,6 +1092,13 @@ switch ($Action) {
             $lastErrorCategory = if ($lastRequest.PSObject.Properties["errorCategory"]) { $lastRequest.errorCategory } else { "" }
             $lastRetrySuppressed = if ($lastRequest.PSObject.Properties["retrySuppressed"]) { $lastRequest.retrySuppressed } else { "" }
             $lastCircuitOpenUntil = if ($lastRequest.PSObject.Properties["circuitOpenUntil"]) { $lastRequest.circuitOpenUntil } else { "" }
+            $lastAttempts = if ($lastRequest.PSObject.Properties["attempts"]) { $lastRequest.attempts } else { "" }
+            $lastRetries = if ($lastRequest.PSObject.Properties["retries"]) { $lastRequest.retries } else { "" }
+            $lastFailureOrigin = if ($lastRequest.PSObject.Properties["failureOrigin"]) { $lastRequest.failureOrigin } else { "" }
+            $lastFailureEvidence = if ($lastRequest.PSObject.Properties["failureEvidence"]) { $lastRequest.failureEvidence } else { "" }
+            $lastFailureBoundary = if ($lastRequest.PSObject.Properties["failureBoundary"]) { $lastRequest.failureBoundary } else { "" }
+            $lastRoutedProviderId = if ($lastRequest.PSObject.Properties["routedProviderId"]) { $lastRequest.routedProviderId } else { "" }
+            $lastProviderSelectionSource = if ($lastRequest.PSObject.Properties["providerSelectionSource"]) { $lastRequest.providerSelectionSource } else { "" }
             Write-Output "last_conversation_id=$lastConversationId"
             Write-Output "last_conversation_title=$lastConversationTitle"
             Write-Output "last_conversation_cwd=$lastConversationCwd"
@@ -1064,6 +1112,13 @@ switch ($Action) {
             Write-Output "last_error_category=$lastErrorCategory"
             Write-Output "last_retry_suppressed=$lastRetrySuppressed"
             Write-Output "last_circuit_open_until=$lastCircuitOpenUntil"
+            Write-Output "last_attempts=$lastAttempts"
+            Write-Output "last_retries=$lastRetries"
+            Write-Output "last_failure_origin=$lastFailureOrigin"
+            Write-Output "last_failure_evidence=$lastFailureEvidence"
+            Write-Output "last_failure_boundary=$lastFailureBoundary"
+            Write-Output "last_routed_provider_id=$lastRoutedProviderId"
+            Write-Output "last_provider_selection_source=$lastProviderSelectionSource"
         } else {
             Write-Output "last_repair_status=no-request-recorded"
         }

@@ -288,18 +288,52 @@ Provider，而不必强制修改历史数据库。
 此外，Bridge 会只读检查 CC Switch 的当前 Provider 元数据：
 
 - `meta.routing_disabled=true` 时直接返回 HTTP 424，且不发送任何上游请求；
-- 默认对 `anyrouter-codex-gpt6` 启用健康门禁；CC Switch 已标记不健康时直接返回
-  HTTP 424；
-- AnyRouter 在健康状态过时的情况下返回 4xx/5xx、空成功响应、连接异常或流中途
-  终止时，Bridge 会输出结构化错误并打开默认 60 秒的本地短路；短路期间请求继续
-  返回 424，不会静默退出或不断撞击上游；
-- 状态文件记录 `activeProviderId`、`errorCategory`、`retrySuppressed` 与
-  `circuitOpenUntil`，不记录响应正文或凭据。
+- AnyRouter 的历史 `unhealthy` 状态只作为 `healthAdvisory` 记录，不再阻止新的真实
+  请求；这允许断续可用的上游自行恢复；
+- AnyRouter 对 408、425、429、500、502、503、504、空成功响应、首包超时和连接异常
+  默认最多尝试 3 次，使用有上限的指数退避；每个新请求仍可重新尝试，不设置默认
+  跨请求熔断；
+- 重试耗尽后返回结构化 HTTP 424，并通过 CC Switch 的错误代码区分
+  `upstream_provider`、`local_router`、`client_request` 和无法诚实归因的
+  `indeterminate`，不再把所有故障一概报告成上游错误；
+- 状态文件记录 `attempts`、`retries`、`retryHistory`、`failureOrigin`、
+  `failureEvidence` 与 `failureBoundary`，不记录响应正文或凭据。
 
-健康门禁与短路名单可用重复的 `--health-guard-provider <provider-id>` 参数配置，
-短路时长可用 `--provider-circuit-seconds` 调整。OpenCode Go 当前仅在本机 CC Switch
+重试名单、次数与退避可分别用 `--retry-provider`、`--provider-max-attempts` 和
+`--provider-retry-backoff-seconds` 调整。原健康门禁与短路仍可通过
+`--health-guard-provider` 和 `--provider-circuit-seconds` 显式启用，但 AnyRouter 默认
+不再使用它们。OpenCode Go 当前仅在本机 CC Switch
 数据库中标记为“订阅过期、禁止路由”；它的 Provider 配置与凭据仍保留，以便以后
 恢复订阅后重新启用。
+
+### 显式逐请求 Provider 路由
+
+该能力默认关闭，只有启动 Bridge 时显式声明的 Provider 才能被选择。每条请求绑定
+自己的不可变上游，不修改 CC Switch 的全局 `is_current`，因此并发请求不会因为热切换
+而串线。
+
+```powershell
+.\scripts\Manage-CodexCrossProviderBridge.ps1 -Action install `
+  -ProviderRoute @("debug-provider=http://127.0.0.1:18080/v1") `
+  -ProviderMaxAttempts 3 `
+  -ProviderRetryBackoffSeconds 0.5
+```
+
+调试普通请求时显式传入请求头：
+
+```text
+X-Codex-Bridge-Provider: debug-provider
+```
+
+无法单独设置请求头的 subagent 可把模型写成
+`debug-provider::gpt-6-astra`。Bridge 用前缀选择 Provider，只把
+`gpt-6-astra` 发给目标上游；未知 Provider、空模型或请求头与模型前缀冲突都会在本地
+返回 HTTP 400，且不会误发到默认 Provider。
+
+远程路由必须使用 HTTPS；HTTP 只允许 loopback。若目标需要 Bearer 凭据，使用
+`-ProviderRouteBearerEnv @("debug-provider=DEBUG_PROVIDER_API_KEY")` 传入环境变量名，
+不要把密钥写进参数、配置、日志或仓库。显式直连时 Bridge 不会转发 Codex 原有的
+Authorization/Cookie。
 
 通用、可逆的 Provider 声明工具不会读取或删除 `settings_config`。先预览，再应用：
 
@@ -458,6 +492,13 @@ last_active_provider_id
 last_error_category
 last_retry_suppressed
 last_circuit_open_until
+last_attempts
+last_retries
+last_failure_origin
+last_failure_evidence
+last_failure_boundary
+last_routed_provider_id
+last_provider_selection_source
 in_flight_request_count
 conversation_history_found
 conversation_history_repair_required
@@ -837,7 +878,7 @@ PowerShell 脚本请使用 PowerShell 7（`pwsh`）。在 Windows PowerShell 5.1
 - 流式转发
 - 在途请求记录
 - 上游首包超时与停滞中止
-- Provider 禁用/不健康预检、空响应、异常状态与本地短路
+- Provider 显式禁用、AnyRouter 有界重试、故障边界归因与请求级显式路由
 - legacy `/responses/compact` 清理
 - 远程压缩 provider/model 风险检测
 - 单会话 provider 状态迁移与备份

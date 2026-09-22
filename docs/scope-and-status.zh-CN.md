@@ -138,6 +138,13 @@ last_active_provider_id
 last_error_category
 last_retry_suppressed
 last_circuit_open_until
+last_attempts
+last_retries
+last_failure_origin
+last_failure_evidence
+last_failure_boundary
+last_routed_provider_id
+last_provider_selection_source
 in_flight_request_count
 conversation_history_repair_required
 ```
@@ -155,10 +162,14 @@ conversation_history_repair_required
   `upstream-headers-timeout`、`upstream-empty-response`、`client-aborted`、
   `upstream-error`、`provider-upstream-error` 或 `provider-blocked`。
 - `last_active_provider_id`：Bridge 从 CC Switch 数据库只读取得的当前 Provider ID。
-- `last_error_category`：例如 `provider_disabled`、`provider_unavailable`、
-  `provider_circuit_open` 或 `provider_upstream_error`。
-- `last_retry_suppressed`：是否已用本地 424/短路阻止继续撞击不可用 Provider。
-- `last_circuit_open_until`：本地短路的 Unix 时间戳；没有短路时为空。
+- `last_error_category`：例如 `provider_disabled`、`upstream_provider_error`、
+  `local_router_error`、`client_request_error` 或 `provider_path_error`。
+- `last_attempts` / `last_retries`：本次请求的实际尝试次数与重试次数。
+- `last_failure_origin` / `last_failure_evidence` / `last_failure_boundary`：依据 CC Switch
+  结构化错误或实际连接边界给出的归因；证据不足时 origin 为 `indeterminate`。
+- `last_routed_provider_id` / `last_provider_selection_source`：显式请求级路由及其来源。
+- `last_retry_suppressed` / `last_circuit_open_until`：仅在显式启用旧健康门禁/短路策略时
+  使用；AnyRouter 默认不再跨请求短路。
 - `in_flight_request_count`：仍在转发中的请求数量；大于 0 时还会输出
   `in_flight_request=<path> started_at=<时间戳>`。
 

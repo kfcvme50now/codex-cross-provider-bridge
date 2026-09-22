@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -219,6 +220,14 @@ class _AcceptingResponsesHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class _DefaultRouteHandler(_AcceptingResponsesHandler):
+    requests: list[dict] = []
+
+
+class _ExplicitRouteHandler(_AcceptingResponsesHandler):
+    requests: list[dict] = []
+
+
 class _FailingResponsesHandler(BaseHTTPRequestHandler):
     requests = 0
 
@@ -229,7 +238,58 @@ class _FailingResponsesHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(length)
         type(self).requests += 1
-        body = b'{"error":{"message":"temporary upstream failure"}}'
+        body = (
+            b'{"error":{"message":"temporary upstream failure",'
+            b'"type":"upstream_error","code":"cc_switch_upstream_error",'
+            b'"upstream_status":503}}'
+        )
+        self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _IntermittentResponsesHandler(BaseHTTPRequestHandler):
+    requests = 0
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        type(self).requests += 1
+        if type(self).requests < 3:
+            body = (
+                b'{"error":{"message":"temporary upstream failure",'
+                b'"type":"upstream_error","code":"cc_switch_upstream_error",'
+                b'"upstream_status":503}}'
+            )
+            self.send_response(503)
+        else:
+            body = b'{"type":"response.completed","response":{"output":[]}}'
+            self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _LocalRouterErrorHandler(BaseHTTPRequestHandler):
+    requests = 0
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        type(self).requests += 1
+        body = (
+            b'{"error":{"message":"no provider is configured",'
+            b'"type":"proxy_error","code":"cc_switch_no_available_provider"}}'
+        )
         self.send_response(503)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -292,6 +352,162 @@ def _create_cc_switch_database(
 
 
 class BridgeIntegrationTests(unittest.TestCase):
+    def test_explicit_provider_header_routes_one_request_without_global_switch(self) -> None:
+        _DefaultRouteHandler.requests = []
+        _ExplicitRouteHandler.requests = []
+        default_upstream = ThreadingHTTPServer(("127.0.0.1", 0), _DefaultRouteHandler)
+        explicit_upstream = ThreadingHTTPServer(("127.0.0.1", 0), _ExplicitRouteHandler)
+        threads = [
+            threading.Thread(target=default_upstream.serve_forever, daemon=True),
+            threading.Thread(target=explicit_upstream.serve_forever, daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(
+                default_upstream.server_port,
+                provider_routes={
+                    "debug-provider": f"http://127.0.0.1:{explicit_upstream.server_port}"
+                },
+            )
+            try:
+                body = json.dumps(sample_payload()).encode("utf-8")
+                client = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_port, timeout=5
+                )
+                client.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                        "X-Codex-Bridge-Provider": "debug-provider",
+                    },
+                )
+                response = client.getresponse()
+                response.read()
+                client.close()
+
+                self.assertEqual(response.status, 200)
+                self.assertEqual(_DefaultRouteHandler.requests, [])
+                self.assertEqual(len(_ExplicitRouteHandler.requests), 1)
+                last_request = _wait_for_last_request(
+                    Path(temporary_policy.name) / "status.json", "completed"
+                )
+                self.assertEqual(last_request["routedProviderId"], "debug-provider")
+                self.assertEqual(last_request["providerSelectionSource"], "header")
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            default_upstream.shutdown()
+            explicit_upstream.shutdown()
+            default_upstream.server_close()
+            explicit_upstream.server_close()
+            for thread in threads:
+                thread.join(timeout=5)
+
+    def test_provider_prefixed_model_routes_subagent_and_strips_prefix(self) -> None:
+        _DefaultRouteHandler.requests = []
+        _ExplicitRouteHandler.requests = []
+        default_upstream = ThreadingHTTPServer(("127.0.0.1", 0), _DefaultRouteHandler)
+        explicit_upstream = ThreadingHTTPServer(("127.0.0.1", 0), _ExplicitRouteHandler)
+        threads = [
+            threading.Thread(target=default_upstream.serve_forever, daemon=True),
+            threading.Thread(target=explicit_upstream.serve_forever, daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(
+                default_upstream.server_port,
+                provider_routes={
+                    "debug-provider": f"http://127.0.0.1:{explicit_upstream.server_port}"
+                },
+            )
+            try:
+                payload = sample_payload()
+                payload["model"] = "debug-provider::gpt-6-astra"
+                body = json.dumps(payload).encode("utf-8")
+                client = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_port, timeout=5
+                )
+                client.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = client.getresponse()
+                response.read()
+                client.close()
+
+                self.assertEqual(response.status, 200)
+                self.assertEqual(_DefaultRouteHandler.requests, [])
+                self.assertEqual(_ExplicitRouteHandler.requests[0]["model"], "gpt-6-astra")
+                last_request = _wait_for_last_request(
+                    Path(temporary_policy.name) / "status.json", "completed"
+                )
+                self.assertEqual(last_request["routedProviderId"], "debug-provider")
+                self.assertEqual(last_request["providerSelectionSource"], "model-prefix")
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            default_upstream.shutdown()
+            explicit_upstream.shutdown()
+            default_upstream.server_close()
+            explicit_upstream.server_close()
+            for thread in threads:
+                thread.join(timeout=5)
+
+    def test_unknown_explicit_provider_is_rejected_without_forwarding(self) -> None:
+        _DefaultRouteHandler.requests = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _DefaultRouteHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(upstream.server_port)
+            try:
+                body = json.dumps(sample_payload()).encode("utf-8")
+                client = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_port, timeout=5
+                )
+                client.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                        "X-Codex-Bridge-Provider": "missing-provider",
+                    },
+                )
+                response = client.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                client.close()
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(payload["error"]["code"], "unknown_provider_route")
+                self.assertEqual(_DefaultRouteHandler.requests, [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
     def test_zstd_compressed_codex_request_is_decoded_before_rewrite(self) -> None:
         _AcceptingResponsesHandler.requests = []
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), _AcceptingResponsesHandler)
@@ -443,7 +659,7 @@ class BridgeIntegrationTests(unittest.TestCase):
                 upstream.server_close()
                 upstream_thread.join(timeout=5)
 
-    def test_unhealthy_anyrouter_is_stopped_before_upstream(self) -> None:
+    def test_unhealthy_anyrouter_health_is_advisory_and_request_is_attempted(self) -> None:
         _AcceptingResponsesHandler.requests = []
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), _AcceptingResponsesHandler)
         upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
@@ -473,17 +689,20 @@ class BridgeIntegrationTests(unittest.TestCase):
                         },
                     )
                     response = client.getresponse()
-                    response_body = json.loads(response.read().decode("utf-8"))
+                    response.read()
                     client.close()
 
-                    self.assertEqual(response.status, 424)
-                    self.assertEqual(response_body["error"]["code"], "provider_unavailable")
-                    self.assertEqual(_AcceptingResponsesHandler.requests, [])
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(len(_AcceptingResponsesHandler.requests), 1)
                     last_request = _wait_for_last_request(
                         Path(temporary_policy.name) / "status.json",
-                        "provider-blocked",
+                        "completed",
                     )
-                    self.assertTrue(last_request["retrySuppressed"])
+                    self.assertEqual(
+                        last_request["healthAdvisory"]["consecutiveFailures"],
+                        3,
+                    )
+                    self.assertFalse(last_request["healthAdvisory"]["isHealthy"])
                 finally:
                     server.shutdown()
                     server.server_close()
@@ -540,7 +759,65 @@ class BridgeIntegrationTests(unittest.TestCase):
                 upstream.server_close()
                 upstream_thread.join(timeout=5)
 
-    def test_anyrouter_failure_opens_local_circuit_and_suppresses_retry(self) -> None:
+    def test_anyrouter_transient_failure_retries_until_success(self) -> None:
+        _IntermittentResponsesHandler.requests = 0
+        upstream = ThreadingHTTPServer(
+            ("127.0.0.1", 0), _IntermittentResponsesHandler
+        )
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cc_switch_db = _create_cc_switch_database(
+                Path(directory), "anyrouter-codex-gpt6", healthy=False
+            )
+            try:
+                server, bridge_thread, temporary_policy = start_bridge(
+                    upstream.server_port,
+                    cc_switch_db=cc_switch_db,
+                    provider_retry_backoff_seconds=0,
+                )
+                try:
+                    body = json.dumps(sample_payload()).encode("utf-8")
+                    client = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_port, timeout=5
+                    )
+                    client.request(
+                        "POST",
+                        "/v1/responses",
+                        body=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Content-Length": str(len(body)),
+                        },
+                    )
+                    response = client.getresponse()
+                    response.read()
+                    client.close()
+
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(_IntermittentResponsesHandler.requests, 3)
+                    last_request = _wait_for_last_request(
+                        Path(temporary_policy.name) / "status.json",
+                        "completed",
+                    )
+                    self.assertEqual(last_request["attempts"], 3)
+                    self.assertEqual(last_request["retries"], 2)
+                    self.assertEqual(
+                        [item["failureOrigin"] for item in last_request["retryHistory"]],
+                        ["upstream_provider", "upstream_provider"],
+                    )
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    bridge_thread.join(timeout=5)
+                    temporary_policy.cleanup()
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+
+    def test_anyrouter_exhaustion_reports_upstream_provider_failure(self) -> None:
         _FailingResponsesHandler.requests = 0
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), _FailingResponsesHandler)
         upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
@@ -554,39 +831,39 @@ class BridgeIntegrationTests(unittest.TestCase):
                 server, bridge_thread, temporary_policy = start_bridge(
                     upstream.server_port,
                     cc_switch_db=cc_switch_db,
+                    provider_retry_backoff_seconds=0,
                 )
                 try:
-                    error_codes = []
-                    for _ in range(2):
-                        body = json.dumps(sample_payload()).encode("utf-8")
-                        client = http.client.HTTPConnection(
-                            "127.0.0.1", server.server_port, timeout=5
-                        )
-                        client.request(
-                            "POST",
-                            "/v1/responses",
-                            body=body,
-                            headers={
-                                "Content-Type": "application/json",
-                                "Content-Length": str(len(body)),
-                            },
-                        )
-                        response = client.getresponse()
-                        payload = json.loads(response.read().decode("utf-8"))
-                        client.close()
-                        self.assertEqual(response.status, 424)
-                        error_codes.append(payload["error"]["code"])
-
-                    self.assertEqual(
-                        error_codes,
-                        ["provider_upstream_error", "provider_circuit_open"],
+                    body = json.dumps(sample_payload()).encode("utf-8")
+                    client = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_port, timeout=5
                     )
-                    self.assertEqual(_FailingResponsesHandler.requests, 1)
+                    client.request(
+                        "POST",
+                        "/v1/responses",
+                        body=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Content-Length": str(len(body)),
+                        },
+                    )
+                    response = client.getresponse()
+                    payload = json.loads(response.read().decode("utf-8"))
+                    client.close()
+
+                    self.assertEqual(response.status, 424)
+                    self.assertEqual(payload["error"]["code"], "upstream_provider_error")
+                    self.assertEqual(payload["error"]["failure_origin"], "upstream_provider")
+                    self.assertEqual(payload["error"]["attempts"], 3)
+                    self.assertTrue(payload["error"]["retry_exhausted"])
+                    self.assertEqual(_FailingResponsesHandler.requests, 3)
                     last_request = _wait_for_last_request(
                         Path(temporary_policy.name) / "status.json",
-                        "provider-blocked",
+                        "provider-upstream-error",
                     )
-                    self.assertIn("circuitOpenUntil", last_request)
+                    self.assertEqual(last_request["failureOrigin"], "upstream_provider")
+                    self.assertEqual(last_request["attempts"], 3)
+                    self.assertNotIn("circuitOpenUntil", last_request)
                 finally:
                     server.shutdown()
                     server.server_close()
@@ -596,6 +873,108 @@ class BridgeIntegrationTests(unittest.TestCase):
                 upstream.shutdown()
                 upstream.server_close()
                 upstream_thread.join(timeout=5)
+
+    def test_anyrouter_reports_cc_switch_routing_failure_separately(self) -> None:
+        _LocalRouterErrorHandler.requests = 0
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _LocalRouterErrorHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cc_switch_db = _create_cc_switch_database(
+                Path(directory), "anyrouter-codex-gpt6", healthy=True
+            )
+            try:
+                server, bridge_thread, temporary_policy = start_bridge(
+                    upstream.server_port,
+                    cc_switch_db=cc_switch_db,
+                    provider_retry_backoff_seconds=0,
+                )
+                try:
+                    body = json.dumps(sample_payload()).encode("utf-8")
+                    client = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_port, timeout=5
+                    )
+                    client.request(
+                        "POST",
+                        "/v1/responses",
+                        body=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Content-Length": str(len(body)),
+                        },
+                    )
+                    response = client.getresponse()
+                    payload = json.loads(response.read().decode("utf-8"))
+                    client.close()
+
+                    self.assertEqual(response.status, 424)
+                    self.assertEqual(payload["error"]["code"], "local_router_error")
+                    self.assertEqual(payload["error"]["failure_origin"], "local_router")
+                    self.assertEqual(payload["error"]["failure_evidence"], "cc_switch_no_available_provider")
+                    self.assertEqual(_LocalRouterErrorHandler.requests, 3)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    bridge_thread.join(timeout=5)
+                    temporary_policy.cleanup()
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=5)
+
+    def test_anyrouter_connection_to_local_router_failure_is_not_blame_on_provider(self) -> None:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        probe.listen(3)
+        unused_port = probe.getsockname()[1]
+        def close_router_connections() -> None:
+            for _ in range(3):
+                connection, _address = probe.accept()
+                connection.close()
+
+        probe_thread = threading.Thread(target=close_router_connections, daemon=True)
+        probe_thread.start()
+
+        with tempfile.TemporaryDirectory() as directory:
+            cc_switch_db = _create_cc_switch_database(
+                Path(directory), "anyrouter-codex-gpt6", healthy=False
+            )
+            server, bridge_thread, temporary_policy = start_bridge(
+                unused_port,
+                cc_switch_db=cc_switch_db,
+                provider_retry_backoff_seconds=0,
+            )
+            try:
+                body = json.dumps(sample_payload()).encode("utf-8")
+                client = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_port, timeout=5
+                )
+                client.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = client.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                client.close()
+
+                self.assertEqual(response.status, 424)
+                self.assertEqual(payload["error"]["code"], "local_router_error")
+                self.assertEqual(payload["error"]["failure_origin"], "local_router")
+                self.assertEqual(payload["error"]["failure_boundary"], "bridge_to_cc_switch")
+                self.assertEqual(payload["error"]["attempts"], 3)
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+                probe.close()
+                probe_thread.join(timeout=5)
 
     def test_anyrouter_empty_success_is_reported_as_an_error(self) -> None:
         _EmptyResponsesHandler.requests = 0
@@ -632,12 +1011,13 @@ class BridgeIntegrationTests(unittest.TestCase):
 
                     self.assertEqual(response.status, 424)
                     self.assertEqual(payload["error"]["code"], "provider_empty_response")
-                    self.assertEqual(_EmptyResponsesHandler.requests, 1)
+                    self.assertEqual(_EmptyResponsesHandler.requests, 3)
                     last_request = _wait_for_last_request(
                         Path(temporary_policy.name) / "status.json",
-                        "provider-upstream-error",
+                        "provider-path-error",
                     )
-                    self.assertTrue(last_request["outcomeDetail"]["retrySuppressed"])
+                    self.assertTrue(last_request["outcomeDetail"]["retryExhausted"])
+                    self.assertEqual(last_request["failureOrigin"], "indeterminate")
                 finally:
                     server.shutdown()
                     server.server_close()
@@ -1204,6 +1584,8 @@ def start_bridge(
     upstream_idle_timeout: int | None = None,
     codex_home: Path | None = None,
     cc_switch_db: Path | None = None,
+    provider_retry_backoff_seconds: float | None = None,
+    provider_routes: dict[str, str] | None = None,
 ):
     from codex_cross_provider_bridge import (
         DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
@@ -1230,6 +1612,12 @@ def start_bridge(
             if upstream_idle_timeout is None
             else upstream_idle_timeout
         ),
+        provider_retry_backoff_seconds=(
+            0.01
+            if provider_retry_backoff_seconds is None
+            else provider_retry_backoff_seconds
+        ),
+        provider_routes=provider_routes or {},
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

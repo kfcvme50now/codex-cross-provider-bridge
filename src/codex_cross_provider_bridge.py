@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 try:
     import zstandard
@@ -56,7 +56,34 @@ DEFAULT_POLICY_FILE = DEFAULT_STATE_DIRECTORY / "policy.json"
 DEFAULT_STATUS_FILE = DEFAULT_STATE_DIRECTORY / "status.json"
 DEFAULT_CC_SWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_PRESERVE_STATE_PROVIDER_IDS = ("default", "anyrouter-codex-gpt6")
-DEFAULT_HEALTH_GUARD_PROVIDER_IDS = ("anyrouter-codex-gpt6",)
+DEFAULT_HEALTH_GUARD_PROVIDER_IDS: tuple[str, ...] = ()
+DEFAULT_RETRY_PROVIDER_IDS = ("anyrouter-codex-gpt6",)
+DEFAULT_PROVIDER_MAX_ATTEMPTS = 3
+DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS = 0.5
+TRANSIENT_UPSTREAM_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+LOCAL_ROUTER_ERROR_CODES = frozenset(
+    {
+        "cc_switch_all_providers_circuit_open",
+        "cc_switch_config_error",
+        "cc_switch_database_error",
+        "cc_switch_internal_error",
+        "cc_switch_no_available_provider",
+        "cc_switch_no_providers_configured",
+        "cc_switch_proxy_error",
+        "cc_switch_transform_error",
+    }
+)
+UPSTREAM_PROVIDER_ERROR_CODES = frozenset(
+    {
+        "cc_switch_auth_error",
+        "cc_switch_forward_failed",
+        "cc_switch_max_retries_exceeded",
+        "cc_switch_provider_unhealthy",
+        "cc_switch_timeout",
+        "cc_switch_upstream_error",
+    }
+)
+CLIENT_REQUEST_ERROR_CODES = frozenset({"cc_switch_invalid_request"})
 
 
 @dataclass
@@ -85,6 +112,32 @@ class ProviderRuntimeState:
     consecutive_failures: int
     routing_disabled: bool
     routing_disabled_reason: str
+
+
+@dataclass(frozen=True)
+class FailureDiagnostic:
+    origin: str
+    category: str
+    evidence: str
+    boundary: str
+
+
+@dataclass
+class ForwardAttemptResult:
+    response: http.client.HTTPResponse | None
+    connection: http.client.HTTPConnection | None
+    buffered_body: bytes | None
+    attempts: int
+    retry_history: list[dict[str, object]]
+    failure: FailureDiagnostic | None = None
+    failure_exception: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderRoute:
+    provider_id: str
+    upstream: SplitResult
+    bearer_token_env: str = ""
 
 
 class RequestBodyDecodeError(ValueError):
@@ -131,20 +184,29 @@ def decode_request_body(body: bytes, content_encoding: str) -> bytes:
     return decoded
 
 
-def lookup_current_provider(database: Path) -> ProviderRuntimeState | None:
+def lookup_provider(
+    database: Path,
+    provider_id: str = "",
+) -> ProviderRuntimeState | None:
     """Read only non-secret routing and health metadata from CC Switch."""
     if not database.exists():
         return None
     try:
         connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
         try:
-            row = connection.execute(
+            query = (
                 "select p.id, p.name, p.meta, h.is_healthy, "
                 "coalesce(h.consecutive_failures, 0) "
                 "from providers p left join provider_health h "
                 "on h.provider_id = p.id and h.app_type = p.app_type "
-                "where p.app_type = 'codex' and p.is_current = 1 limit 1"
-            ).fetchone()
+                "where p.app_type = 'codex' and "
+            )
+            if provider_id:
+                row = connection.execute(
+                    query + "p.id = ? limit 1", (provider_id,)
+                ).fetchone()
+            else:
+                row = connection.execute(query + "p.is_current = 1 limit 1").fetchone()
         finally:
             connection.close()
     except sqlite3.Error:
@@ -168,6 +230,10 @@ def lookup_current_provider(database: Path) -> ProviderRuntimeState | None:
     )
 
 
+def lookup_current_provider(database: Path) -> ProviderRuntimeState | None:
+    return lookup_provider(database)
+
+
 def provider_block_reason(
     provider: ProviderRuntimeState | None,
     health_guard_provider_ids: set[str] | frozenset[str],
@@ -187,6 +253,66 @@ def provider_block_reason(
             f"{provider.consecutive_failures} consecutive failures",
         )
     return None
+
+
+def _cc_switch_error_metadata(body: bytes) -> tuple[str, str, bool]:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "", "", False
+    if not isinstance(payload, dict):
+        return "", "", False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return "", "", False
+    code = error.get("code")
+    error_type = error.get("type")
+    has_upstream_status = isinstance(error.get("upstream_status"), int)
+    return (
+        code if isinstance(code, str) else "",
+        error_type if isinstance(error_type, str) else "",
+        has_upstream_status,
+    )
+
+
+def classify_http_failure(status: int, body: bytes) -> FailureDiagnostic:
+    """Classify only from evidence emitted at the CC Switch boundary."""
+    code, error_type, has_upstream_status = _cc_switch_error_metadata(body)
+    if code in LOCAL_ROUTER_ERROR_CODES:
+        return FailureDiagnostic(
+            "local_router", "local_router_error", code, "cc_switch_router"
+        )
+    if (
+        code in UPSTREAM_PROVIDER_ERROR_CODES
+        or error_type == "upstream_error"
+        or has_upstream_status
+    ):
+        return FailureDiagnostic(
+            "upstream_provider",
+            "upstream_provider_error",
+            code or error_type or f"http_{status}",
+            "router_to_provider",
+        )
+    if code in CLIENT_REQUEST_ERROR_CODES or 400 <= status < 500 and status != 429:
+        return FailureDiagnostic(
+            "client_request",
+            "client_request_error",
+            code or f"http_{status}",
+            "client_to_provider",
+        )
+    if status == 429:
+        return FailureDiagnostic(
+            "upstream_provider",
+            "upstream_provider_error",
+            "http_429",
+            "router_to_provider",
+        )
+    return FailureDiagnostic(
+        "indeterminate",
+        "provider_path_error",
+        code or f"http_{status}",
+        "cc_switch_or_provider",
+    )
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
@@ -491,8 +617,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         path: str,
         body: bytes,
         headers: dict[str, str],
+        upstream: SplitResult | None = None,
     ) -> tuple[http.client.HTTPResponse, http.client.HTTPConnection]:
-        upstream = self.server.upstream  # type: ignore[attr-defined]
+        upstream = upstream or self.server.upstream  # type: ignore[attr-defined]
         connection_class = (
             http.client.HTTPSConnection
             if upstream.scheme == "https"
@@ -520,11 +647,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
             upstream_socket.settimeout(idle_timeout or None)
         return response, connection
 
-    def _build_upstream_path(self) -> str:
-        upstream = self.server.upstream  # type: ignore[attr-defined]
+    def _build_upstream_path(self, upstream: SplitResult | None = None) -> str:
+        upstream = upstream or self.server.upstream  # type: ignore[attr-defined]
         incoming = urlsplit(self.path)
         base_path = upstream.path.rstrip("/")
-        path = f"{base_path}/{incoming.path.lstrip('/')}" if base_path else incoming.path
+        if base_path and (
+            incoming.path == base_path or incoming.path.startswith(base_path + "/")
+        ):
+            path = incoming.path
+        else:
+            path = (
+                f"{base_path}/{incoming.path.lstrip('/')}"
+                if base_path
+                else incoming.path
+            )
         if upstream.query:
             separator = "&" if "?" in path else "?"
             path += separator + upstream.query
@@ -539,9 +675,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
-    def _send_json_error(self, status: int, code: str, message: str) -> None:
+    def _send_json_error(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        error: dict[str, object] = {"code": code, "message": message}
+        if details:
+            error.update(details)
         body = json.dumps(
-            {"error": {"code": code, "message": message}},
+            {"error": error},
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -556,6 +701,135 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
         self.close_connection = True
+
+    def _retry_delay(self, completed_attempts: int) -> None:
+        base = self.server.provider_retry_backoff_seconds  # type: ignore[attr-defined]
+        if base > 0:
+            time.sleep(min(base * (2 ** max(0, completed_attempts - 1)), 5.0))
+
+    def _forward_with_retries(
+        self,
+        method: str,
+        path: str,
+        body: bytes,
+        headers: dict[str, str],
+        max_attempts: int,
+        upstream: SplitResult | None = None,
+    ) -> ForwardAttemptResult:
+        attempts = 0
+        retry_history: list[dict[str, object]] = []
+        while attempts < max_attempts:
+            attempts += 1
+            connection: http.client.HTTPConnection | None = None
+            try:
+                response, connection = self._forward(
+                    method, path, body, headers, upstream=upstream
+                )
+            except TimeoutError:
+                failure = FailureDiagnostic(
+                    "indeterminate",
+                    "provider_path_timeout",
+                    "bridge_header_timeout",
+                    "bridge_to_router_or_provider",
+                )
+                if attempts < max_attempts:
+                    retry_history.append(
+                        {
+                            "attempt": attempts,
+                            "failureOrigin": failure.origin,
+                            "failureCategory": failure.category,
+                            "failureEvidence": failure.evidence,
+                            "failureBoundary": failure.boundary,
+                        }
+                    )
+                    self._retry_delay(attempts)
+                    continue
+                return ForwardAttemptResult(
+                    None,
+                    None,
+                    None,
+                    attempts,
+                    retry_history,
+                    failure,
+                    "TimeoutError",
+                )
+            except (OSError, http.client.HTTPException) as exc:
+                failure = FailureDiagnostic(
+                    "local_router",
+                    "local_router_error",
+                    type(exc).__name__,
+                    "bridge_to_cc_switch",
+                )
+                if attempts < max_attempts:
+                    retry_history.append(
+                        {
+                            "attempt": attempts,
+                            "failureOrigin": failure.origin,
+                            "failureCategory": failure.category,
+                            "failureEvidence": failure.evidence,
+                            "failureBoundary": failure.boundary,
+                        }
+                    )
+                    self._retry_delay(attempts)
+                    continue
+                return ForwardAttemptResult(
+                    None,
+                    None,
+                    None,
+                    attempts,
+                    retry_history,
+                    failure,
+                    type(exc).__name__,
+                )
+
+            declared_length = (response.getheader("Content-Length") or "").strip()
+            empty_success = response.status == 204 or (
+                200 <= response.status < 300 and declared_length == "0"
+            )
+            transient = response.status in TRANSIENT_UPSTREAM_STATUSES
+            if not transient and not empty_success:
+                return ForwardAttemptResult(
+                    response,
+                    connection,
+                    None,
+                    attempts,
+                    retry_history,
+                )
+
+            buffered_body = response.read()
+            if empty_success:
+                failure = FailureDiagnostic(
+                    "indeterminate",
+                    "provider_empty_response",
+                    "empty_success_response",
+                    "cc_switch_or_provider",
+                )
+            else:
+                failure = classify_http_failure(response.status, buffered_body)
+            if attempts < max_attempts:
+                retry_history.append(
+                    {
+                        "attempt": attempts,
+                        "upstreamStatus": response.status,
+                        "failureOrigin": failure.origin,
+                        "failureCategory": failure.category,
+                        "failureEvidence": failure.evidence,
+                        "failureBoundary": failure.boundary,
+                    }
+                )
+                connection.close()
+                self._retry_delay(attempts)
+                continue
+            return ForwardAttemptResult(
+                response,
+                connection,
+                buffered_body,
+                attempts,
+                retry_history,
+                failure,
+            )
+
+        raise AssertionError("retry loop must return")
 
     def _relay_failure_event(self, outcome: str, detail: dict[str, object]) -> None:
         """Best-effort SSE error so a stalled stream is not an endless wait."""
@@ -713,6 +987,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "policyFileText": policy_file_text,
                     "statusFile": str(self.server.status_file),  # type: ignore[attr-defined]
                     "codexHome": str(self.server.codex_home),  # type: ignore[attr-defined]
+                    "providerRoutes": sorted(self.server.provider_routes),  # type: ignore[attr-defined]
+                    "retryProviders": sorted(self.server.retry_provider_ids),  # type: ignore[attr-defined]
+                    "providerMaxAttempts": self.server.provider_max_attempts,  # type: ignore[attr-defined]
+                    "providerRetryBackoffSeconds": self.server.provider_retry_backoff_seconds,  # type: ignore[attr-defined]
                     "policy": {
                         "scope": policy.scope,
                         "armed": policy.armed,
@@ -761,11 +1039,96 @@ class BridgeHandler(BaseHTTPRequestHandler):
         active_provider = lookup_current_provider(
             self.server.cc_switch_db  # type: ignore[attr-defined]
         )
+        selected_provider_id = (
+            self.headers.get("X-Codex-Bridge-Provider") or ""
+        ).strip()
+        provider_selection_source = "header" if selected_provider_id else "default"
+        selected_route: ProviderRoute | None = None
+        routed_upstream = self.server.upstream  # type: ignore[attr-defined]
+        explicit_model = ""
+        if selected_provider_id:
+            selected_route = self.server.provider_routes.get(  # type: ignore[attr-defined]
+                selected_provider_id
+            )
+            if selected_route is None:
+                self._send_json_error(
+                    400,
+                    "unknown_provider_route",
+                    f"No explicit route is configured for provider {selected_provider_id!r}.",
+                )
+                return
+            routed_upstream = selected_route.upstream
+            active_provider = lookup_provider(
+                self.server.cc_switch_db,  # type: ignore[attr-defined]
+                selected_provider_id,
+            ) or ProviderRuntimeState(
+                selected_provider_id,
+                selected_provider_id,
+                None,
+                0,
+                False,
+                "",
+            )
         provider_state_preserved = False
 
         if body and "json" in content_type and _is_responses_path(self.path):
             try:
                 original_payload = json.loads(body.decode("utf-8"))
+                if isinstance(original_payload, dict):
+                    model_before = str(original_payload.get("model") or "")
+                    if "::" in model_before:
+                        model_provider_id, explicit_model = model_before.split("::", 1)
+                        model_provider_id = model_provider_id.strip()
+                        explicit_model = explicit_model.strip()
+                        if not model_provider_id or not explicit_model:
+                            self._send_json_error(
+                                400,
+                                "invalid_provider_model_selector",
+                                "Provider-prefixed models must use provider-id::model.",
+                            )
+                            return
+                        if (
+                            selected_provider_id
+                            and selected_provider_id != model_provider_id
+                        ):
+                            self._send_json_error(
+                                400,
+                                "provider_route_conflict",
+                                "The provider request header and model prefix select "
+                                "different providers.",
+                            )
+                            return
+                        selected_provider_id = model_provider_id
+                        provider_selection_source = (
+                            "header+model-prefix"
+                            if provider_selection_source == "header"
+                            else "model-prefix"
+                        )
+                        selected_route = self.server.provider_routes.get(  # type: ignore[attr-defined]
+                            selected_provider_id
+                        )
+                        if selected_route is None:
+                            self._send_json_error(
+                                400,
+                                "unknown_provider_route",
+                                f"No explicit route is configured for provider "
+                                f"{selected_provider_id!r}.",
+                            )
+                            return
+                        routed_upstream = selected_route.upstream
+                        active_provider = lookup_provider(
+                            self.server.cc_switch_db,  # type: ignore[attr-defined]
+                            selected_provider_id,
+                        ) or ProviderRuntimeState(
+                            selected_provider_id,
+                            selected_provider_id,
+                            None,
+                            0,
+                            False,
+                            "",
+                        )
+                        original_payload = dict(original_payload)
+                        original_payload["model"] = explicit_model
                 conversation_id, conversation_id_source = extract_conversation_id(
                     self.headers,
                     original_payload,
@@ -789,10 +1152,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     save_policy(self.server.policy_file, policy)  # type: ignore[attr-defined]
 
                 if targeted:
-                    if isinstance(original_payload, dict):
+                    if isinstance(original_payload, dict) and not model_before:
                         model_before = str(original_payload.get("model") or "")
                     effective_model_override = self.server.model_override  # type: ignore[attr-defined]
-                    if not effective_model_override and needs_repair:
+                    if explicit_model:
+                        effective_model_override = explicit_model
+                    elif not effective_model_override and needs_repair:
                         effective_model_override = conversation_model
                     original_payload = override_model(
                         original_payload,
@@ -815,6 +1180,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ).encode("utf-8")
+                elif explicit_model:
+                    model_after = explicit_model
+                    body = json.dumps(
+                        original_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 self.send_error(400, f"Invalid JSON request body: {exc}")
                 return
@@ -827,9 +1199,23 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "content-length",
                 "content-encoding",
                 "accept-encoding",
+                "x-codex-bridge-provider",
             }:
                 continue
+            if selected_route is not None and lower in {"authorization", "cookie"}:
+                continue
             request_headers[key] = value
+        if selected_route is not None and selected_route.bearer_token_env:
+            bearer_token = os.environ.get(selected_route.bearer_token_env, "")
+            if not bearer_token:
+                self._send_json_error(
+                    424,
+                    "provider_route_credential_unavailable",
+                    "The explicit provider route credential environment variable is unset.",
+                    {"provider_id": selected_provider_id},
+                )
+                return
+            request_headers["Authorization"] = f"Bearer {bearer_token}"
         if body:
             request_headers["Content-Length"] = str(len(body))
         request_headers["Accept-Encoding"] = "identity"
@@ -858,9 +1244,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "repairStatus": repair_status,
             "activeProviderId": active_provider.provider_id if active_provider else "",
             "activeProviderName": active_provider.name if active_provider else "",
+            "routedProviderId": selected_provider_id,
+            "providerSelectionSource": provider_selection_source,
             "requestPath": urlsplit(self.path).path,
             "startedAt": time.time(),
         }
+        if active_provider is not None and active_provider.is_healthy is False:
+            request_descriptor["healthAdvisory"] = {
+                "isHealthy": False,
+                "consecutiveFailures": active_provider.consecutive_failures,
+                "note": "Historical CC Switch health only; request was not blocked.",
+            }
 
         blocked = provider_block_reason(
             active_provider,
@@ -912,51 +1306,132 @@ class BridgeHandler(BaseHTTPRequestHandler):
         buffered_body: bytes | None = None
         retried = False
         retry_report = SanitizeReport()
+        total_attempts = 0
+        retry_history: list[dict[str, object]] = []
         outcome = "upstream-error"
         outcome_detail: dict[str, object] = {}
         upstream_status: int | None = None
+        final_http_failure: FailureDiagnostic | None = None
 
         self._begin_request(request_descriptor)
 
         try:
-            upstream_path = self._build_upstream_path()
-            try:
-                upstream_response, connection = self._forward(
+            upstream_path = self._build_upstream_path(routed_upstream)
+            retry_enabled = bool(
+                active_provider is not None
+                and active_provider.provider_id
+                in self.server.retry_provider_ids  # type: ignore[attr-defined]
+                and self.command in {"POST", "PUT", "PATCH"}
+            )
+            if retry_enabled:
+                attempt_result = self._forward_with_retries(
                     self.command,
                     upstream_path,
                     body,
                     request_headers,
+                    self.server.provider_max_attempts,  # type: ignore[attr-defined]
+                    upstream=routed_upstream,
                 )
-            except TimeoutError:
-                outcome = "upstream-headers-timeout"
-                outcome_detail = {
-                    "headerTimeoutSeconds": self.server.upstream_header_timeout,  # type: ignore[attr-defined]
-                }
-                if (
-                    active_provider is not None
-                    and active_provider.provider_id
-                    in self.server.health_guard_provider_ids  # type: ignore[attr-defined]
-                ):
-                    circuit = self.server.open_provider_circuit(  # type: ignore[attr-defined]
-                        active_provider.provider_id,
-                        "upstream-headers-timeout",
+                upstream_response = attempt_result.response
+                connection = attempt_result.connection
+                buffered_body = attempt_result.buffered_body
+                total_attempts = attempt_result.attempts
+                retry_history = attempt_result.retry_history
+                if attempt_result.failure is not None:
+                    failure = attempt_result.failure
+                    upstream_status = (
+                        upstream_response.status if upstream_response is not None else None
                     )
-                    outcome = "provider-upstream-error"
-                    outcome_detail["circuitOpenUntil"] = circuit["openUntil"]
+                    outcome = (
+                        "provider-upstream-error"
+                        if failure.origin == "upstream_provider"
+                        else "local-router-error"
+                        if failure.origin == "local_router"
+                        else "provider-path-error"
+                    )
+                    outcome_detail = {
+                        "failureOrigin": failure.origin,
+                        "failureCategory": failure.category,
+                        "failureEvidence": failure.evidence,
+                        "failureBoundary": failure.boundary,
+                        "attempts": total_attempts,
+                        "retries": max(0, total_attempts - 1),
+                        "retryExhausted": True,
+                    }
+                    if upstream_status is not None:
+                        outcome_detail["upstreamStatus"] = upstream_status
+                    if retry_history:
+                        outcome_detail["retryHistory"] = retry_history
+                    origin_label = {
+                        "upstream_provider": "the upstream provider",
+                        "local_router": "the local CC Switch routing layer",
+                    }.get(failure.origin, "the CC Switch-to-provider path")
                     self._send_json_error(
                         424,
-                        "provider_upstream_error",
-                        "Request stopped: the provider did not answer before the "
-                        "header timeout. The local circuit is now open; no automatic "
-                        "upstream retry will be attempted.",
+                        failure.category,
+                        f"Request failed after {total_attempts} bounded attempts at "
+                        f"{origin_label}. Automatic retries are exhausted; the bridge "
+                        "will allow the next request to try again.",
+                        {
+                            "failure_origin": failure.origin,
+                            "failure_evidence": failure.evidence,
+                            "failure_boundary": failure.boundary,
+                            "attempts": total_attempts,
+                            "retries": max(0, total_attempts - 1),
+                            "retry_exhausted": True,
+                            **(
+                                {"upstream_status": upstream_status}
+                                if upstream_status is not None
+                                else {}
+                            ),
+                        },
                     )
-                else:
-                    self._send_error_quietly(
-                        504,
-                        "Upstream did not send response headers before the bridge "
-                        "timeout. The provider may be stalled.",
+                    return
+                if upstream_response is None:
+                    raise AssertionError("successful forward must include a response")
+            else:
+                try:
+                    upstream_response, connection = self._forward(
+                        self.command,
+                        upstream_path,
+                        body,
+                        request_headers,
+                        upstream=routed_upstream,
                     )
-                return
+                    total_attempts = 1
+                except TimeoutError:
+                    outcome = "upstream-headers-timeout"
+                    outcome_detail = {
+                        "headerTimeoutSeconds": self.server.upstream_header_timeout,  # type: ignore[attr-defined]
+                    }
+                    if (
+                        active_provider is not None
+                        and active_provider.provider_id
+                        in self.server.health_guard_provider_ids  # type: ignore[attr-defined]
+                    ):
+                        circuit = self.server.open_provider_circuit(  # type: ignore[attr-defined]
+                            active_provider.provider_id,
+                            "upstream-headers-timeout",
+                        )
+                        outcome = "provider-upstream-error"
+                        outcome_detail["circuitOpenUntil"] = circuit["openUntil"]
+                        self._send_json_error(
+                            424,
+                            "provider_upstream_error",
+                            "Request stopped: the provider did not answer before the "
+                            "header timeout. The local circuit is now open; no automatic "
+                            "upstream retry will be attempted.",
+                        )
+                    else:
+                        self._send_error_quietly(
+                            504,
+                            "Upstream did not send response headers before the bridge "
+                            "timeout. The provider may be stalled.",
+                        )
+                    return
+
+            if upstream_response is None:
+                raise AssertionError("forward did not return a response")
 
             if (
                 original_payload is not None
@@ -979,10 +1454,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         upstream_path,
                         portable_body,
                         retry_headers,
+                        upstream=routed_upstream,
                     )
                     retried = True
+                    total_attempts += 1
                 else:
                     buffered_body = first_error
+
+            if retry_enabled and not 200 <= upstream_response.status < 300:
+                if buffered_body is None:
+                    buffered_body = upstream_response.read()
+                final_http_failure = classify_http_failure(
+                    upstream_response.status,
+                    buffered_body,
+                )
 
             guarded_provider = bool(
                 active_provider is not None
@@ -1037,11 +1522,50 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            outcome, outcome_detail = self._forward_response(
+            relay_outcome, relay_detail = self._forward_response(
                 upstream_response,
                 buffered_body,
             )
+            outcome = relay_outcome
+            outcome_detail = relay_detail
             upstream_status = upstream_response.status
+            if final_http_failure is not None and relay_outcome == "completed":
+                outcome = (
+                    "provider-upstream-error"
+                    if final_http_failure.origin == "upstream_provider"
+                    else "local-router-error"
+                    if final_http_failure.origin == "local_router"
+                    else "client-request-error"
+                    if final_http_failure.origin == "client_request"
+                    else "provider-path-error"
+                )
+                outcome_detail = {
+                    **relay_detail,
+                    "failureOrigin": final_http_failure.origin,
+                    "failureCategory": final_http_failure.category,
+                    "failureEvidence": final_http_failure.evidence,
+                    "failureBoundary": final_http_failure.boundary,
+                    "attempts": total_attempts,
+                    "retries": max(0, total_attempts - 1),
+                    "retryExhausted": False,
+                    "upstreamStatus": upstream_response.status,
+                }
+            elif retry_enabled and relay_outcome in {
+                "upstream-idle-timeout",
+                "upstream-error",
+                "upstream-empty-response",
+            }:
+                outcome_detail.update(
+                    {
+                        "failureOrigin": "indeterminate",
+                        "failureCategory": "provider_stream_error",
+                        "failureEvidence": relay_outcome,
+                        "failureBoundary": "cc_switch_or_provider_stream",
+                        "attempts": total_attempts,
+                        "retries": max(0, total_attempts - 1),
+                        "retryUnsafeAfterResponseStarted": True,
+                    }
+                )
             if guarded_provider and outcome in {
                 "upstream-idle-timeout",
                 "upstream-error",
@@ -1084,11 +1608,23 @@ class BridgeHandler(BaseHTTPRequestHandler):
             final_status["outcome"] = outcome
             final_status["upstreamStatus"] = upstream_status
             final_status["portableRetry"] = retried
+            final_status["attempts"] = total_attempts
+            final_status["retries"] = max(0, total_attempts - 1)
+            if retry_history:
+                final_status["retryHistory"] = retry_history
             final_status["removedItemIds"] = report.removed_item_ids
             final_status["removedEncryptedReasoning"] = (
                 report.removed_encrypted_reasoning
             )
-            if outcome == "provider-upstream-error" or outcome_detail.get(
+            if outcome_detail.get("failureOrigin") is not None:
+                final_status["failureOrigin"] = outcome_detail["failureOrigin"]
+                final_status["failureEvidence"] = outcome_detail["failureEvidence"]
+                final_status["failureBoundary"] = outcome_detail["failureBoundary"]
+                final_status["errorCategory"] = outcome_detail["failureCategory"]
+                final_status["retryExhausted"] = bool(
+                    outcome_detail.get("retryExhausted")
+                )
+            elif outcome == "provider-upstream-error" or outcome_detail.get(
                 "retrySuppressed"
             ):
                 final_status["errorCategory"] = "provider_upstream_error"
@@ -1144,6 +1680,11 @@ class BridgeServer(ThreadingHTTPServer):
         preserve_state_provider_ids: tuple[str, ...] = DEFAULT_PRESERVE_STATE_PROVIDER_IDS,
         health_guard_provider_ids: tuple[str, ...] = DEFAULT_HEALTH_GUARD_PROVIDER_IDS,
         provider_circuit_seconds: int = DEFAULT_PROVIDER_CIRCUIT_SECONDS,
+        retry_provider_ids: tuple[str, ...] = DEFAULT_RETRY_PROVIDER_IDS,
+        provider_max_attempts: int = DEFAULT_PROVIDER_MAX_ATTEMPTS,
+        provider_retry_backoff_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS,
+        provider_routes: dict[str, str] | None = None,
+        provider_route_bearer_envs: dict[str, str] | None = None,
         upstream_header_timeout: int = DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
         upstream_idle_timeout: int = DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
     ) -> None:
@@ -1161,6 +1702,41 @@ class BridgeServer(ThreadingHTTPServer):
         self.preserve_state_provider_ids = frozenset(preserve_state_provider_ids)
         self.health_guard_provider_ids = frozenset(health_guard_provider_ids)
         self.provider_circuit_seconds = max(1, int(provider_circuit_seconds))
+        self.retry_provider_ids = frozenset(retry_provider_ids)
+        self.provider_max_attempts = max(1, int(provider_max_attempts))
+        self.provider_retry_backoff_seconds = max(
+            0.0, float(provider_retry_backoff_seconds)
+        )
+        self.provider_routes: dict[str, ProviderRoute] = {}
+        bearer_envs = provider_route_bearer_envs or {}
+        for provider_id, route_url in (provider_routes or {}).items():
+            normalized_id = str(provider_id).strip()
+            parsed_route = urlsplit(str(route_url))
+            if not normalized_id:
+                raise ValueError("provider route ID must not be empty")
+            if (
+                parsed_route.scheme not in {"http", "https"}
+                or not parsed_route.hostname
+                or parsed_route.username is not None
+                or parsed_route.password is not None
+            ):
+                raise ValueError(
+                    f"provider route {normalized_id!r} must be an absolute HTTP(S) URL "
+                    "without embedded credentials"
+                )
+            if parsed_route.scheme == "http" and parsed_route.hostname not in {
+                "127.0.0.1",
+                "::1",
+                "localhost",
+            }:
+                raise ValueError(
+                    f"provider route {normalized_id!r} must use HTTPS unless it is loopback"
+                )
+            self.provider_routes[normalized_id] = ProviderRoute(
+                normalized_id,
+                parsed_route,
+                str(bearer_envs.get(normalized_id) or "").strip(),
+            )
         self.provider_circuit_lock = threading.Lock()
         self.provider_circuits: dict[str, dict[str, object]] = {}
         self.upstream_header_timeout = max(0, int(upstream_header_timeout))
@@ -1210,6 +1786,11 @@ def create_server(
     preserve_state_provider_ids: tuple[str, ...] = DEFAULT_PRESERVE_STATE_PROVIDER_IDS,
     health_guard_provider_ids: tuple[str, ...] = DEFAULT_HEALTH_GUARD_PROVIDER_IDS,
     provider_circuit_seconds: int = DEFAULT_PROVIDER_CIRCUIT_SECONDS,
+    retry_provider_ids: tuple[str, ...] = DEFAULT_RETRY_PROVIDER_IDS,
+    provider_max_attempts: int = DEFAULT_PROVIDER_MAX_ATTEMPTS,
+    provider_retry_backoff_seconds: float = DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS,
+    provider_routes: dict[str, str] | None = None,
+    provider_route_bearer_envs: dict[str, str] | None = None,
     upstream_header_timeout: int = DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
     upstream_idle_timeout: int = DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
 ) -> BridgeServer:
@@ -1226,9 +1807,28 @@ def create_server(
         preserve_state_provider_ids=preserve_state_provider_ids,
         health_guard_provider_ids=health_guard_provider_ids,
         provider_circuit_seconds=provider_circuit_seconds,
+        retry_provider_ids=retry_provider_ids,
+        provider_max_attempts=provider_max_attempts,
+        provider_retry_backoff_seconds=provider_retry_backoff_seconds,
+        provider_routes=provider_routes,
+        provider_route_bearer_envs=provider_route_bearer_envs,
         upstream_header_timeout=upstream_header_timeout,
         upstream_idle_timeout=upstream_idle_timeout,
     )
+
+
+def parse_mapping_options(values: list[str] | None, option_name: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or []:
+        key, separator, mapped_value = value.partition("=")
+        key = key.strip()
+        mapped_value = mapped_value.strip()
+        if not separator or not key or not mapped_value:
+            raise ValueError(f"{option_name} expects NAME=VALUE")
+        if key in result:
+            raise ValueError(f"{option_name} repeats {key!r}")
+        result[key] = mapped_value
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -1267,6 +1867,45 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to suppress guarded-provider retries after an upstream failure.",
     )
     parser.add_argument(
+        "--retry-provider",
+        action="append",
+        dest="retry_providers",
+        help=(
+            "Provider ID allowed bounded retries for transient failures. "
+            "Repeat for multiple providers; defaults to anyrouter-codex-gpt6."
+        ),
+    )
+    parser.add_argument(
+        "--provider-max-attempts",
+        type=int,
+        default=DEFAULT_PROVIDER_MAX_ATTEMPTS,
+        help="Maximum attempts for retry-enabled providers, including the first attempt.",
+    )
+    parser.add_argument(
+        "--provider-retry-backoff-seconds",
+        type=float,
+        default=DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS,
+        help="Initial exponential backoff between bounded provider retry attempts.",
+    )
+    parser.add_argument(
+        "--provider-route",
+        action="append",
+        dest="provider_routes",
+        help=(
+            "Opt-in per-request provider route as PROVIDER_ID=HTTP_URL. "
+            "The route is selected by X-Codex-Bridge-Provider or provider::model."
+        ),
+    )
+    parser.add_argument(
+        "--provider-route-bearer-env",
+        action="append",
+        dest="provider_route_bearer_envs",
+        help=(
+            "Bearer credential environment variable as PROVIDER_ID=ENV_NAME. "
+            "The secret itself must not be passed on the command line."
+        ),
+    )
+    parser.add_argument(
         "--upstream-header-timeout",
         type=int,
         default=DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
@@ -1284,6 +1923,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     listen_host, listen_port_text = args.listen.rsplit(":", 1)
+    try:
+        provider_routes = parse_mapping_options(args.provider_routes, "--provider-route")
+        provider_route_bearer_envs = parse_mapping_options(
+            args.provider_route_bearer_envs,
+            "--provider-route-bearer-env",
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    unknown_bearer_routes = set(provider_route_bearer_envs) - set(provider_routes)
+    if unknown_bearer_routes:
+        raise SystemExit(
+            "--provider-route-bearer-env requires a matching --provider-route for: "
+            + ", ".join(sorted(unknown_bearer_routes))
+        )
     server = create_server(
         listen_host=listen_host,
         listen_port=int(listen_port_text),
@@ -1300,6 +1953,13 @@ def main() -> int:
             args.health_guard_providers or DEFAULT_HEALTH_GUARD_PROVIDER_IDS
         ),
         provider_circuit_seconds=args.provider_circuit_seconds,
+        retry_provider_ids=tuple(
+            args.retry_providers or DEFAULT_RETRY_PROVIDER_IDS
+        ),
+        provider_max_attempts=args.provider_max_attempts,
+        provider_retry_backoff_seconds=args.provider_retry_backoff_seconds,
+        provider_routes=provider_routes,
+        provider_route_bearer_envs=provider_route_bearer_envs,
         upstream_header_timeout=args.upstream_header_timeout,
         upstream_idle_timeout=args.upstream_idle_timeout,
     )

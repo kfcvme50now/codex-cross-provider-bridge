@@ -121,13 +121,20 @@ Bridge 的首选替代。
 
 ## 本项目当前选择
 
-本版本只实现不会引入 Provider 串线的基础能力：
+Bridge 现已实现一个默认关闭、仅供显式调试的请求级路由层：
 
 - Default 与 AnyRouter GPT-6 首次保留已有 Provider 状态；
 - 明确的可移植性错误才触发一次清理重放；
-- 禁用或不健康 Provider 在上游调用前失败；
-- AnyRouter 的异常返回、空响应、断流和超时进入可见错误与本地短路；
+- `routing_disabled=true` 的 Provider 在上游调用前失败；历史健康状态只作为提示；
+- AnyRouter 的瞬时状态、空响应、连接异常和首包超时执行有上限的多次尝试，不设置
+  默认跨请求熔断；
+- 通过 `--provider-route PROVIDER_ID=URL` 建立显式 allowlist；请求使用
+  `X-Codex-Bridge-Provider`，subagent 使用 `PROVIDER_ID::MODEL`；
+- 每次请求冻结自己的目标 URL，不修改 CC Switch 全局 current provider；
+- CC Switch 结构化错误会被区分为上游 Provider、本地 Router、客户端请求或无法确定，
+  不以猜测代替证据；
 - OpenCode 配置保留，但订阅过期标记会阻止自动路由。
 
-真正的模型/推理强度动态选路应放在独立 Router 或 CC Switch 的请求级 Provider
-选择层，不能通过反复切换全局 Provider 状态实现。
+当前实现不会自动猜测 Provider。推理强度仍由 Codex 请求或 subagent 配置显式给出并
+原样传递。自动语义路由仍应另设规则层；不能通过反复切换 CC Switch 全局 Provider
+状态实现。
