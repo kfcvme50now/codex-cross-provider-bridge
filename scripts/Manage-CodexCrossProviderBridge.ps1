@@ -24,6 +24,16 @@
     "ProviderRetryBackoffSeconds",
     Justification = "Forwarded from script scope when the scheduled bridge task is registered."
 )]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    "PSReviewUnusedParameter",
+    "RouteProfilePath",
+    Justification = "Forwarded from script scope by the default route restore function."
+)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    "PSReviewUnusedParameter",
+    "SkipRouteRestore",
+    Justification = "Forwarded from script scope by the default route restore function."
+)]
 param(
     [ValidateSet(
         "install",
@@ -31,6 +41,7 @@ param(
         "start",
         "stop",
         "restart",
+        "restore-route",
         "repair",
         "backup",
         "restore",
@@ -113,7 +124,9 @@ param(
     [ValidateRange(1, 10)]
     [int]$ProviderMaxAttempts = 3,
     [ValidateRange(0.0, 60.0)]
-    [double]$ProviderRetryBackoffSeconds = 0.5
+    [double]$ProviderRetryBackoffSeconds = 0.5,
+    [string]$RouteProfilePath = "",
+    [switch]$SkipRouteRestore
 )
 
 . (Join-Path $PSScriptRoot "CodexCrossProviderBridge.Common.ps1")
@@ -134,6 +147,9 @@ if (-not $ConfigPath) {
     $ConfigPath = Join-Path $CodexHome "config.toml"
 }
 $BridgeUrl = "http://127.0.0.1:$BridgePort/v1"
+if (-not $RouteProfilePath) {
+    $RouteProfilePath = Join-Path (Split-Path $PSScriptRoot -Parent) "config\codex-route-default.json"
+}
 if (-not $BridgeStateDirectory) {
     $BridgeStateDirectory = Join-Path (Split-Path $PSScriptRoot -Parent) "state"
 }
@@ -677,6 +693,129 @@ function Restore-ThreadProviderMigration {
     Write-Output $output
 }
 
+function Restore-DefaultCodexRoute {
+    if ($SkipRouteRestore) {
+        Write-Output "route_restore=skipped"
+        return
+    }
+    if (-not (Test-Path -LiteralPath $RouteProfilePath -PathType Leaf)) {
+        throw "Default route profile not found: $RouteProfilePath"
+    }
+    $routeProfile = Get-Content -Raw -LiteralPath $RouteProfilePath | ConvertFrom-Json
+
+    $providerId = ""
+    if ($routeProfile.PSObject.Properties["modelProvider"]) {
+        $providerId = [string]$routeProfile.modelProvider
+    }
+    if ($providerId -notmatch '^[A-Za-z0-9._-]+$') {
+        throw "Default route profile has an invalid modelProvider: '$providerId'"
+    }
+
+    $provider = $null
+    if ($routeProfile.PSObject.Properties["provider"]) {
+        $provider = $routeProfile.provider
+    }
+    if (-not $provider) {
+        throw "Default route profile is missing the provider block"
+    }
+    $providerName = ""
+    $baseUrl = ""
+    $wireApi = ""
+    $requiresAuth = "false"
+    $websockets = "false"
+    if ($provider.PSObject.Properties["name"]) {
+        $providerName = [string]$provider.name
+    }
+    if ($provider.PSObject.Properties["baseUrl"]) {
+        $baseUrl = [string]$provider.baseUrl
+    }
+    if ($provider.PSObject.Properties["wireApi"]) {
+        $wireApi = [string]$provider.wireApi
+    }
+    if ($provider.PSObject.Properties["requiresOpenaiAuth"] -and [bool]$provider.requiresOpenaiAuth) {
+        $requiresAuth = "true"
+    }
+    if ($provider.PSObject.Properties["supportsWebsockets"] -and [bool]$provider.supportsWebsockets) {
+        $websockets = "true"
+    }
+    if ($baseUrl -notmatch '^http://127\.0\.0\.1:\d+/v1$') {
+        throw "Default route profile baseUrl must be a loopback http:// URL ending in /v1"
+    }
+    if (-not $providerName -or -not $wireApi) {
+        throw "Default route profile provider block needs name and wireApi"
+    }
+
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        throw "Codex config not found: $ConfigPath"
+    }
+    $raw = [System.IO.File]::ReadAllText($ConfigPath)
+    $updated = $raw
+
+    $providerIdEscaped = [regex]::Escape($providerId)
+    $blockPattern = "(?ms)^\[model_providers\.$providerIdEscaped\]\s*\r?\n.*?(?=^\[|\z)"
+    $blockMatch = [regex]::Match($updated, $blockPattern)
+    if ($blockMatch.Success) {
+        $block = $blockMatch.Value
+        if ($block -match '(?m)^base_url\s*=') {
+            $newBlock = [regex]::Replace($block, '(?m)^base_url\s*=.*$', "base_url = `"$baseUrl`"", 1)
+        } else {
+            $newBlock = $block.TrimEnd("`r", "`n") + "`r`n" + "base_url = `"$baseUrl`"`r`n"
+        }
+        $updated = $updated.Substring(0, $blockMatch.Index) + $newBlock + $updated.Substring($blockMatch.Index + $blockMatch.Length)
+    } else {
+        $newBlock = @"
+[model_providers.$providerId]
+name = "$providerName"
+base_url = "$baseUrl"
+wire_api = "$wireApi"
+requires_openai_auth = $requiresAuth
+supports_websockets = $websockets
+
+"@
+        $updated = $updated.TrimEnd() + "`r`n`r`n" + $newBlock
+    }
+
+    if ($updated -match '(?m)^model_provider\s*=') {
+        $updated = [regex]::Replace($updated, '(?m)^model_provider\s*=.*$', "model_provider = `"$providerId`"", 1)
+    } elseif ($updated -match '(?m)^model\s*=') {
+        $updated = [regex]::Replace($updated, '(?m)^(model\s*=.*)$', "`$1`r`nmodel_provider = `"$providerId`"", 1)
+    } else {
+        $updated = "model_provider = `"$providerId`"`r`n" + $updated
+    }
+
+    if ($updated -eq $raw) {
+        Write-Output "route_restore=already-current"
+        Write-Output "route_model_provider=$providerId"
+        Write-Output "route_base_url=$baseUrl"
+        return
+    }
+
+    $snapshot = New-CodexBridgeSnapshot `
+        -Reason "pre-route-restore" `
+        -ConfigPath $ConfigPath `
+        -BridgeScript $BridgeScript
+    $temporaryPath = "$ConfigPath.default-route.$PID.tmp"
+    Write-Utf8NoBom -Path $temporaryPath -Content $updated
+
+    try {
+        if (-not (Test-TomlFile -Path $temporaryPath)) {
+            throw "Temporary config is not valid TOML"
+        }
+        Move-Item -LiteralPath $temporaryPath -Destination $ConfigPath -Force
+    } catch {
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force
+        }
+        Restore-CodexBridgeSnapshot -SnapshotDirectory $snapshot.Directory -KeepCurrentTask | Out-Null
+        throw
+    }
+
+    Write-Output "route_restore=restored"
+    Write-Output "route_model_provider=$providerId"
+    Write-Output "route_base_url=$baseUrl"
+    Write-Output "route_snapshot_id=$($snapshot.SnapshotId)"
+}
+
 function Repair-HistoricalProviderAlias {
     if ($HistoryScope -eq "none") {
         Write-Output "history_repair=skipped"
@@ -823,6 +962,9 @@ switch ($Action) {
         if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
             throw "Bridge task $TaskName is not installed; run -Action install first"
         }
+        # The Codex route is restored from the tracked default profile before the
+        # bridge comes back; a running Codex picks it up on its next start.
+        Restore-DefaultCodexRoute
         # Only the bridge task is touched; the automation task is periodic and
         # resumes on its own trigger.
         Stop-ScheduledTask -TaskName $TaskName
@@ -835,6 +977,9 @@ switch ($Action) {
             throw "Bridge did not become ready on port $BridgePort"
         }
         Write-BridgeRuntime -Status "restarted"
+    }
+    "restore-route" {
+        Restore-DefaultCodexRoute
     }
     "repair" {
         Write-RuntimePolicy `

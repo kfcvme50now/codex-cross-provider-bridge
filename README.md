@@ -366,7 +366,12 @@ pwsh .\scripts\Manage-CodexCrossProviderBridge.ps1 -Action restart
 
 也可以双击仓库根目录的 `Restart-CodexBridge.cmd`。
 
-记录只包含路径、时间、状态码和字节数，不包含请求正文、响应正文或凭据。
+记录只包含路径、时间、来源（`source` 与截断的 User-Agent）、状态码和字节数，
+不包含请求正文、响应正文或凭据。每次完成的请求会追加一行到
+`state\request-log.jsonl`（超过 16 MB 时滚动为 `.1`），`status.json` 的
+`lastRequest` 同样带有 `source` 字段。`source` 优先取请求的 `originator` 头，
+缺失时按 User-Agent 归类（如 `codex_cli_rs`、`codex_app`、`browser`），因此不同
+客户端（Codex、浏览器网页端等）的请求在本地日志中按来源分开，不会混在一起。
 
 ## 作用范围
 
@@ -548,17 +553,29 @@ Invoke-RestMethod http://127.0.0.1:15722/__bridge/info
 
 ### 一键启动与重启
 
-停止 → 启动 → 等待端口就绪并校验 `/__bridge/info`，三件事由 `restart` 动作一次完成：
+`restart` 动作会先按默认路由档案恢复 Codex 路由，再执行停止 → 启动 → 等待端口
+就绪并校验 `/__bridge/info`：
 
 ```powershell
 pwsh .\scripts\Manage-CodexCrossProviderBridge.ps1 -Action restart
 ```
+
+默认路由档案是受版本管理的 `config\codex-route-default.json`，内容取自 2026-09-30
+修复后的状态：`model_provider` 与对应 provider 块都指向本机 Bridge
+（`http://127.0.0.1:15722/v1`），不使用“上一次运行”的快照。修改该文件即可改变
+默认状态；恢复是幂等的，已经是默认状态时只报告 `route_restore=already-current`。
+路由写入后，新启动的 Codex 立即生效；已在运行的 Codex 在下次启动时生效。只想
+恢复路由、不重启 Bridge 时用 `-Action restore-route`；只想重启、不动路由时加
+`-SkipRouteRestore`。
 
 需要双击即可完成时，使用仓库根目录的 `Restart-CodexBridge.cmd`（等价于上面的
 命令；桌面快捷方式「重启 Codex Bridge」指向它）。启动器要求 `pwsh` 在 PATH 中，
 失败时保留窗口显示原因，成功时显示结果并在 5 秒后自动关闭：
 
 ```text
+route_restore=restored
+route_model_provider=cc-switch-official
+route_base_url=http://127.0.0.1:15722/v1
 status=restarted
 task=CodexCrossProviderBridge
 task_state=Running
@@ -840,6 +857,8 @@ CC Switch 设置默认只备份、不覆盖。需要恢复时显式指定：
 |-- README.md
 |-- SECURITY.md
 |-- Restart-CodexBridge.cmd
+|-- config/
+|   `-- codex-route-default.json
 |-- docs/
 |   |-- investigation.zh-CN.md
 |   |-- lifecycle-hooks.zh-CN.md
@@ -908,7 +927,9 @@ PowerShell 脚本请使用 PowerShell 7（`pwsh`）。在 Windows PowerShell 5.1
 - 保守重试
 - 流式转发
 - 在途请求记录
+- 请求来源标注与 `request-log.jsonl`（仅元数据，不含正文）
 - 上游首包超时与停滞中止
+- 默认路由档案恢复与幂等性
 - Provider 显式禁用、AnyRouter 有界重试、故障边界归因与请求级显式路由
 - legacy `/responses/compact` 清理
 - 远程压缩 provider/model 风险检测

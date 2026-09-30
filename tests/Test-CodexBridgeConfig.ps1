@@ -265,8 +265,37 @@ print(json.dumps({"type": "turn.completed"}))
         -BridgeStateDirectory $managedState | Out-Null
     Assert-True ((Get-Content -Raw -LiteralPath $managedHooks) -notmatch 'codex_lifecycle_hook') "manager did not remove its managed hooks"
 
+    $routeConfig = Join-Path $temporaryRoot "route-config.toml"
+    @'
+model = "example-model"
+
+[model_providers.custom]
+name = "Example"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+'@ | Set-Content -LiteralPath $routeConfig -Encoding utf8
+    $routeProfile = Join-Path $repositoryRoot "config\codex-route-default.json"
+    $routeOutput = & $bridgeManager `
+        -Action restore-route `
+        -ConfigPath $routeConfig `
+        -BridgeStateDirectory $managedState `
+        -RouteProfilePath $routeProfile
+    $routeText = $routeOutput -join "`n"
+    Assert-True ($routeText -match '(?m)^route_restore=restored$') "default route restore did not run"
+    $routeContent = Get-Content -Raw -LiteralPath $routeConfig
+    Assert-True ($routeContent -match '(?m)^model_provider = "cc-switch-official"$') "model_provider was not restored"
+    Assert-True ($routeContent -match '(?ms)^\[model_providers\.cc-switch-official\]\s*\r?\n.*base_url = "http://127\.0\.0\.1:15722/v1"') "restored provider must point at the bridge"
+    $routeHash = Get-Sha256Hex -Path $routeConfig
+    $routeAgain = & $bridgeManager `
+        -Action restore-route `
+        -ConfigPath $routeConfig `
+        -BridgeStateDirectory $managedState `
+        -RouteProfilePath $routeProfile
+    Assert-True ((Get-Sha256Hex -Path $routeConfig) -eq $routeHash) "repeat route restore must be idempotent"
+    Assert-True (($routeAgain -join "`n") -match '(?m)^route_restore=already-current$') "second route restore should report already-current"
+
     Write-Output "status=passed"
-    Write-Output "tests=historical_alias,new_provider_metadata,idempotency,backup_restore,input_validation,automation_guard,post_switch_probe,lifecycle_hook_backup_restore,manager_compact_hook"
+    Write-Output "tests=historical_alias,new_provider_metadata,idempotency,backup_restore,input_validation,automation_guard,post_switch_probe,lifecycle_hook_backup_restore,manager_compact_hook,route_restore"
 } finally {
     Remove-Item Env:CODEX_BRIDGE_BACKUP_ROOT -ErrorAction SilentlyContinue
     $resolvedTemporaryRoot = [System.IO.Path]::GetFullPath($temporaryRoot)

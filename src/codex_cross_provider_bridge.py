@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -63,6 +64,10 @@ DEFAULT_HEALTH_GUARD_PROVIDER_IDS: tuple[str, ...] = ()
 DEFAULT_RETRY_PROVIDER_IDS = ("anyrouter-codex-gpt6",)
 DEFAULT_PROVIDER_MAX_ATTEMPTS = 3
 DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS = 0.5
+REQUEST_LOG_NAME = "request-log.jsonl"
+REQUEST_LOG_MAX_BYTES = 16 * 1024 * 1024
+MAX_CLIENT_LABEL_CHARS = 120
+MAX_USER_AGENT_CHARS = 160
 TRANSIENT_UPSTREAM_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 LOCAL_ROUTER_ERROR_CODES = frozenset(
     {
@@ -222,6 +227,27 @@ def decode_request_body(body: bytes, content_encoding: str) -> bytes:
             "decompressed request body exceeds the bridge limit",
         )
     return decoded
+
+
+def classify_request_source(headers: Mapping[str, str]) -> tuple[str, str]:
+    """Attribute a request to its local client so logs keep sources separate."""
+    originator = (headers.get("originator") or "").strip()
+    user_agent = (headers.get("user-agent") or "").strip()
+    label = originator
+    if not label and user_agent:
+        lowered = user_agent.lower()
+        token = user_agent.split("/", 1)[0].strip()
+        if "codex" in lowered:
+            label = token if token.lower().startswith("codex") else "codex"
+        elif "mozilla/" in lowered:
+            label = "browser"
+        elif "claude" in lowered or "anthropic" in lowered:
+            label = token or "claude"
+        else:
+            label = "unknown"
+    if not label:
+        label = "unknown"
+    return label[:MAX_CLIENT_LABEL_CHARS], user_agent[:MAX_USER_AGENT_CHARS]
 
 
 def lookup_provider(
@@ -1057,13 +1083,39 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 outcome, detail = self._forward_response(response)
                 bytes_relayed = int(detail.get("bytesRelayed", 0))
             self.log_message(
-                "POST /v1/messages -> %d; outcome=%s; bytes_relayed=%d",
+                "POST /v1/messages -> %d; outcome=%s; bytes_relayed=%d; source=%s",
                 response.status, outcome, bytes_relayed,
+                getattr(self, "request_source", "unknown"),
+            )
+            self._append_request_log(
+                {
+                    "requestPath": "/v1/messages",
+                    "source": getattr(self, "request_source", "unknown"),
+                    "outcome": outcome,
+                    "upstreamStatus": response.status,
+                    "outcomeDetail": {"bytesRelayed": bytes_relayed},
+                }
             )
         except TimeoutError:
             self._send_json_error(504, "upstream_header_timeout", "Claude upstream response headers timed out")
+            self._append_request_log(
+                {
+                    "requestPath": "/v1/messages",
+                    "source": getattr(self, "request_source", "unknown"),
+                    "outcome": "upstream-headers-timeout",
+                    "upstreamStatus": 504,
+                }
+            )
         except (OSError, http.client.HTTPException) as exc:
             self._send_json_error(502, "upstream_connection_error", f"Claude upstream connection failed: {type(exc).__name__}")
+            self._append_request_log(
+                {
+                    "requestPath": "/v1/messages",
+                    "source": getattr(self, "request_source", "unknown"),
+                    "outcome": "upstream-connection-error",
+                    "upstreamStatus": 502,
+                }
+            )
         finally:
             if connection is not None:
                 connection.close()
@@ -1105,11 +1157,48 @@ class BridgeHandler(BaseHTTPRequestHandler):
         with server.policy_lock:
             if key is not None:
                 server.in_flight.pop(key, None)
+            if "source" not in final_status:
+                final_status["source"] = getattr(self, "request_source", "unknown")
             server.last_request = final_status
             server.request_count += 1
+            self._append_request_log(final_status)
         return self._publish_status()
 
+    def _append_request_log(self, final_status: dict[str, object]) -> None:
+        """Append one metadata-only line per request; logging never fails a request."""
+        try:
+            server = self.server  # type: ignore[attr-defined]
+            detail = final_status.get("outcomeDetail")
+            record = {
+                "time": time.time(),
+                "path": str(final_status.get("requestPath") or ""),
+                "source": str(final_status.get("source") or ""),
+                "outcome": str(final_status.get("outcome") or ""),
+                "upstreamStatus": final_status.get("upstreamStatus"),
+                "attempts": final_status.get("attempts"),
+                "bytesRelayed": (
+                    detail.get("bytesRelayed") if isinstance(detail, dict) else None
+                ),
+                "model": str(
+                    final_status.get("modelAfter")
+                    or final_status.get("conversationModel")
+                    or ""
+                ),
+            }
+            log_path = server.status_file.parent / REQUEST_LOG_NAME
+            if log_path.exists() and log_path.stat().st_size > REQUEST_LOG_MAX_BYTES:
+                os.replace(log_path, log_path.parent / (log_path.name + ".1"))
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+        except OSError:
+            pass
+
     def _handle(self) -> None:
+        source, user_agent = classify_request_source(self.headers)
+        self.request_source = source
+        self.request_user_agent = user_agent
         if self.command == "POST" and urlsplit(self.path).path == "/v1/messages":
             self._handle_claude_messages()
             return
@@ -1389,6 +1478,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "routedProviderId": selected_provider_id,
             "providerSelectionSource": provider_selection_source,
             "requestPath": urlsplit(self.path).path,
+            "source": getattr(self, "request_source", "unknown"),
+            "clientUserAgent": getattr(self, "request_user_agent", ""),
             "startedAt": time.time(),
         }
         if active_provider is not None and active_provider.is_healthy is False:

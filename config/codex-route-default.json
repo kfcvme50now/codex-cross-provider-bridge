@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "note": "Codex 默认路由档案（本对话修复后的基线）。一键重启会先应用它，再重启 Bridge；修改此文件即可改变默认状态。",
+  "modelProvider": "cc-switch-official",
+  "provider": {
+    "name": "OpenAI",
+    "baseUrl": "http://127.0.0.1:15722/v1",
+    "wireApi": "responses",
+    "requiresOpenaiAuth": true,
+    "supportsWebsockets": false
+  }
+}

@@ -1819,6 +1819,97 @@ class BridgeStallTests(unittest.TestCase):
             upstream_thread.join(timeout=5)
 
 
+class BridgeRequestSourceTests(unittest.TestCase):
+    def test_classify_request_source_prefers_originator_and_detects_clients(self) -> None:
+        from codex_cross_provider_bridge import classify_request_source
+
+        self.assertEqual(
+            classify_request_source(
+                {"originator": "codex_app", "user-agent": "probe/1"}
+            )[0],
+            "codex_app",
+        )
+        self.assertEqual(
+            classify_request_source(
+                {"user-agent": "codex_cli_rs/0.30.0 (Windows 11; x86_64)"}
+            )[0],
+            "codex_cli_rs",
+        )
+        self.assertEqual(
+            classify_request_source(
+                {"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            )[0],
+            "browser",
+        )
+        self.assertEqual(
+            classify_request_source(
+                {"user-agent": "claude-cli/2.1.280 (external, cli)"}
+            )[0],
+            "claude-cli",
+        )
+        self.assertEqual(classify_request_source({})[0], "unknown")
+
+    def test_request_source_and_metadata_log_stay_body_free(self) -> None:
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _AcceptingResponsesHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            server, bridge_thread, temporary_policy = start_bridge(upstream.server_port)
+            status_file = Path(temporary_policy.name) / "status.json"
+            log_file = Path(temporary_policy.name) / "request-log.jsonl"
+            try:
+                payload = sample_payload()
+                payload["input"][0]["content"][0]["text"] = "BODY_MARKER_MUST_NOT_APPEAR"
+                body = json.dumps(payload).encode("utf-8")
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=30,
+                )
+                connection.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                        "User-Agent": "codex_cli_rs/0.30.0 (Windows 11; x86_64)",
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                connection.close()
+
+                self.assertEqual(response.status, 200)
+                last_request = _wait_for_last_request(status_file, "completed")
+                self.assertEqual(last_request["source"], "codex_cli_rs")
+                self.assertEqual(
+                    last_request["clientUserAgent"],
+                    "codex_cli_rs/0.30.0 (Windows 11; x86_64)",
+                )
+
+                deadline = time.time() + 10
+                while not log_file.exists() and time.time() < deadline:
+                    time.sleep(0.05)
+                log_text = log_file.read_text(encoding="utf-8")
+                log_lines = [
+                    json.loads(line) for line in log_text.splitlines() if line.strip()
+                ]
+                self.assertEqual(log_lines[-1]["source"], "codex_cli_rs")
+                self.assertEqual(log_lines[-1]["path"], "/v1/responses")
+                self.assertNotIn("BODY_MARKER_MUST_NOT_APPEAR", log_text)
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge_thread.join(timeout=5)
+                temporary_policy.cleanup()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+
 def start_bridge(
     upstream_port: int,
     upstream_header_timeout: int | None = None,

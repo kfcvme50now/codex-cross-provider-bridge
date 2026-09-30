@@ -158,6 +158,10 @@ conversation_history_repair_required
 
 - `last_request_path`：最后一次请求的路径（`/v1/responses` 或
   `/v1/responses/compact`）。
+- `last_request_source` / `last_request_user_agent`：请求来源，优先取 `originator`
+  头，否则按 User-Agent 归类（如 `codex_cli_rs`、`browser`），用于把不同客户端的
+  请求分开查看；每次完成的请求还会向 `state/request-log.jsonl` 追加一行仅含元数据
+  的记录（超过 16 MB 时滚动为 `.1`）。
 - `last_request_outcome`：`completed`、`upstream-idle-timeout`、
   `upstream-headers-timeout`、`upstream-empty-response`、`client-aborted`、
   `upstream-error`、`provider-upstream-error` 或 `provider-blocked`。
