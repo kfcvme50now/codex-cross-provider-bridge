@@ -14,6 +14,7 @@ import http.client
 import io
 import json
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -48,6 +49,7 @@ PORTABILITY_ERROR_MARKERS = (
     b"array too long",
 )
 MAX_BODY_BYTES = 256 * 1024 * 1024
+MAX_CLAUDE_SSE_FRAME_BYTES = 4 * 1024 * 1024
 DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS = 120
 DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS = 120
 DEFAULT_PROVIDER_CIRCUIT_SECONDS = 60
@@ -84,6 +86,43 @@ UPSTREAM_PROVIDER_ERROR_CODES = frozenset(
     }
 )
 CLIENT_REQUEST_ERROR_CODES = frozenset({"cc_switch_invalid_request"})
+
+
+class ClaudeSseFramer:
+    """Keep complete Anthropic SSE frames and identify the protocol terminal event."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def push(self, chunk: bytes) -> list[tuple[bytes, str]]:
+        self.buffer.extend(chunk)
+        frames: list[tuple[bytes, str]] = []
+        while match := re.search(rb"\r?\n\r?\n", self.buffer):
+            if match.end() > MAX_CLAUDE_SSE_FRAME_BYTES:
+                raise ValueError("Claude SSE frame exceeds the local size limit")
+            frame = bytes(self.buffer[: match.end()])
+            del self.buffer[: match.end()]
+            event_type = ""
+            data_lines: list[bytes] = []
+            for line in frame.splitlines():
+                if line.startswith(b"event:"):
+                    event_type = line[6:].strip().decode("ascii", errors="ignore")
+                elif line.startswith(b"data:"):
+                    data_lines.append(line[5:].lstrip())
+            if not event_type and data_lines:
+                try:
+                    payload = json.loads(b"\n".join(data_lines))
+                    if isinstance(payload, dict):
+                        event_type = str(payload.get("type") or "")
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+            frames.append((frame, event_type))
+            if event_type == "message_stop":
+                self.buffer.clear()
+                break
+        if len(self.buffer) > MAX_CLAUDE_SSE_FRAME_BYTES:
+            raise ValueError("Claude SSE frame exceeds the local size limit")
+        return frames
 
 
 @dataclass
@@ -929,6 +968,105 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return "client-aborted", {"bytesRelayed": bytes_relayed}
 
+    def _claude_stream_error(self, code: str) -> None:
+        payload = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": f"Local Claude bridge: {code}",
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            self.wfile.write(b"event: error\ndata: " + payload + b"\n\n")
+            self.wfile.flush()
+        except OSError:
+            pass
+
+    def _forward_claude_stream(
+        self, response: http.client.HTTPResponse
+    ) -> tuple[str, int]:
+        self.send_response(response.status, response.reason)
+        for key, value in response.getheaders():
+            if key.lower() not in HOP_BY_HOP | {"content-length"}:
+                self.send_header(key, value)
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        framer = ClaudeSseFramer()
+        bytes_relayed = 0
+        while True:
+            try:
+                chunk = response.read1(65536)
+                if not chunk:
+                    self._claude_stream_error("upstream_ended_before_message_stop")
+                    self.close_connection = True
+                    return "upstream-ended-before-message-stop", bytes_relayed
+                frames = framer.push(chunk)
+                for frame, event_type in frames:
+                    self.wfile.write(frame)
+                    self.wfile.flush()
+                    bytes_relayed += len(frame)
+                    if event_type == "error":
+                        self.close_connection = True
+                        return "upstream-error-event", bytes_relayed
+                    if event_type == "message_stop":
+                        self.close_connection = True
+                        return "completed-at-message-stop", bytes_relayed
+            except ValueError:
+                self._claude_stream_error("oversized_sse_frame")
+                self.close_connection = True
+                return "oversized-sse-frame", bytes_relayed
+            except TimeoutError:
+                self._claude_stream_error("upstream_idle_timeout")
+                self.close_connection = True
+                return "upstream-idle-timeout", bytes_relayed
+            except (OSError, http.client.HTTPException) as exc:
+                if isinstance(exc, OSError) and isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                    self.close_connection = True
+                    return "client-aborted", bytes_relayed
+                self._claude_stream_error("upstream_stream_error")
+                self.close_connection = True
+                return "upstream-error", bytes_relayed
+
+    def _handle_claude_messages(self) -> None:
+        body = self._read_request_body()
+        if body is None:
+            return
+        headers = {
+            key: value
+            for key, value in self.headers.items()
+            if key.lower() not in HOP_BY_HOP
+            and key.lower() not in {"host", "content-length", "accept-encoding"}
+        }
+        headers["Content-Length"] = str(len(body))
+        headers["Accept-Encoding"] = "identity"
+        connection: http.client.HTTPConnection | None = None
+        try:
+            response, connection = self._forward(
+                self.command, self._build_upstream_path(), body, headers
+            )
+            content_type = (response.getheader("Content-Type") or "").lower()
+            content_encoding = (response.getheader("Content-Encoding") or "").lower()
+            if response.status == 200 and "text/event-stream" in content_type and not content_encoding:
+                outcome, bytes_relayed = self._forward_claude_stream(response)
+            else:
+                outcome, detail = self._forward_response(response)
+                bytes_relayed = int(detail.get("bytesRelayed", 0))
+            self.log_message(
+                "POST /v1/messages -> %d; outcome=%s; bytes_relayed=%d",
+                response.status, outcome, bytes_relayed,
+            )
+        except TimeoutError:
+            self._send_json_error(504, "upstream_header_timeout", "Claude upstream response headers timed out")
+        except (OSError, http.client.HTTPException) as exc:
+            self._send_json_error(502, "upstream_connection_error", f"Claude upstream connection failed: {type(exc).__name__}")
+        finally:
+            if connection is not None:
+                connection.close()
+
     def _publish_status(self) -> str:
         """Rewrite the status file from current in-memory bridge state."""
         server = self.server  # type: ignore[attr-defined]
@@ -971,6 +1109,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return self._publish_status()
 
     def _handle(self) -> None:
+        if self.command == "POST" and urlsplit(self.path).path == "/v1/messages":
+            self._handle_claude_messages()
+            return
         if urlsplit(self.path).path == "/__bridge/info":
             policy_path = self.server.policy_file  # type: ignore[attr-defined]
             policy = load_policy(policy_path)
@@ -1657,6 +1798,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             )
 
     do_GET = _handle
+    do_HEAD = _handle
     do_POST = _handle
     do_PUT = _handle
     do_PATCH = _handle

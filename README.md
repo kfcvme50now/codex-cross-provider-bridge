@@ -359,9 +359,10 @@ python .\src\codex_ccswitch_provider_policy.py `
 两个阈值都是秒数，设为 `0` 表示关闭该限制。修改后需要重启 Bridge 任务：
 
 ```powershell
-pwsh .\scripts\Manage-CodexCrossProviderBridge.ps1 -Action stop
-pwsh .\scripts\Manage-CodexCrossProviderBridge.ps1 -Action start
+pwsh .\scripts\Manage-CodexCrossProviderBridge.ps1 -Action restart
 ```
+
+也可以双击仓库根目录的 `Restart-CodexBridge.cmd`。
 
 记录只包含路径、时间、状态码和字节数，不包含请求正文、响应正文或凭据。
 
@@ -542,6 +543,33 @@ Get-ScheduledTask -TaskName "CodexCrossProviderBridge"
 ```powershell
 Invoke-RestMethod http://127.0.0.1:15722/__bridge/info
 ```
+
+### 一键启动与重启
+
+停止 → 启动 → 等待端口就绪并校验 `/__bridge/info`，三件事由 `restart` 动作一次完成：
+
+```powershell
+pwsh .\scripts\Manage-CodexCrossProviderBridge.ps1 -Action restart
+```
+
+需要双击即可完成时，使用仓库根目录的 `Restart-CodexBridge.cmd`（等价于上面的
+命令；桌面快捷方式「重启 Codex Bridge」指向它）。启动器要求 `pwsh` 在 PATH 中，
+失败时保留窗口显示原因，成功时显示结果并在 5 秒后自动关闭：
+
+```text
+status=restarted
+task=CodexCrossProviderBridge
+task_state=Running
+bridge_url=http://127.0.0.1:15722/v1
+bridge_pid=18972
+```
+
+`-Action start` 同样会等待就绪，因此在 Bridge 已在运行时重复执行是幂等的。
+`restart` 只重启 Bridge 任务，不动自动修复任务；后者是周期任务，会按自己的
+触发器恢复。若 15722 被计划任务之外的进程占用，`restart` 会报出该进程 PID 而
+不会结束它。
+
+重建桌面快捷方式：右键 `Restart-CodexBridge.cmd` → 发送到 → 桌面快捷方式。
 
 ## 自动修复
 
@@ -809,6 +837,7 @@ CC Switch 设置默认只备份、不覆盖。需要恢复时显式指定：
 .
 |-- README.md
 |-- SECURITY.md
+|-- Restart-CodexBridge.cmd
 |-- docs/
 |   |-- investigation.zh-CN.md
 |   |-- lifecycle-hooks.zh-CN.md

@@ -1384,7 +1384,7 @@ def _wait_for_last_request(
     raise AssertionError(f"last request never reached outcome={expected_outcome}")
 
 
-class BridgeStallTests(unittest.TestCase):
+class BridgeInFlightTests(unittest.TestCase):
     def test_in_flight_request_is_visible_before_upstream_answers(self) -> None:
         _StallingResponsesHandler.started = threading.Event()
         _StallingResponsesHandler.release = threading.Event()
@@ -1468,6 +1468,247 @@ class BridgeStallTests(unittest.TestCase):
             upstream.server_close()
             upstream_thread.join(timeout=5)
 
+
+class _HeldOpenClaudeAndCodexHandler(BaseHTTPRequestHandler):
+    terminal_sent = threading.Event()
+    release = threading.Event()
+    claude_body = b""
+    claude_auth_present = False
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_HEAD(self) -> None:
+        self.send_response(204)
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        if self.path == "/v1/messages":
+            type(self).claude_body = body
+            type(self).claude_auth_present = bool(self.headers.get("x-api-key"))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b'event: message_start\ndata: {"type":"message_start"}\n\n')
+            self.wfile.write(b'event: message_st')
+            self.wfile.flush()
+            self.wfile.write(b'op\ndata: {"type":"message_stop"}\n\n')
+            self.wfile.flush()
+            type(self).terminal_sent.set()
+            type(self).release.wait(timeout=5)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+
+class _Claude429Handler(BaseHTTPRequestHandler):
+    requests = 0
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        type(self).requests += 1
+        body = b'{"error":{"message":"Service Unavailable"}}'
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Retry-After", "2")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _IncompleteClaudeHandler(BaseHTTPRequestHandler):
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(b'event: message_start\ndata: {"type":"message_start"}\n\n')
+        self.wfile.flush()
+
+
+class _HeldOpenClaudeErrorHandler(BaseHTTPRequestHandler):
+    terminal_sent = threading.Event()
+    release = threading.Event()
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(b'event: error\ndata: {"type":"error","error":{"type":"upstream_error"}}\n\n')
+        self.wfile.flush()
+        type(self).terminal_sent.set()
+        type(self).release.wait(timeout=5)
+
+
+class SharedClaudeBridgeTests(unittest.TestCase):
+    def test_oversized_complete_sse_frame_is_rejected(self) -> None:
+        from codex_cross_provider_bridge import ClaudeSseFramer, MAX_CLAUDE_SSE_FRAME_BYTES
+
+        framer = ClaudeSseFramer()
+        frame = b"event: message_stop\ndata: " + b"x" * MAX_CLAUDE_SSE_FRAME_BYTES + b"\n\n"
+        with self.assertRaises(ValueError):
+            framer.push(frame)
+
+    def test_claude_message_stop_ends_stream_without_upstream_eof_and_codex_still_works(self) -> None:
+        _HeldOpenClaudeAndCodexHandler.terminal_sent = threading.Event()
+        _HeldOpenClaudeAndCodexHandler.release = threading.Event()
+        _HeldOpenClaudeAndCodexHandler.claude_body = b""
+        _HeldOpenClaudeAndCodexHandler.claude_auth_present = False
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _HeldOpenClaudeAndCodexHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        server, bridge_thread, temporary_policy = start_bridge(upstream.server_port)
+        try:
+            result: dict[str, object] = {}
+
+            def call_claude() -> None:
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+                try:
+                    connection.request(
+                        "POST", "/v1/messages", body=b'{"stream":true}',
+                        headers={"Content-Type": "application/json", "x-api-key": "test-only"},
+                    )
+                    response = connection.getresponse()
+                    result["status"] = response.status
+                    result["body"] = response.read()
+                finally:
+                    connection.close()
+
+            worker = threading.Thread(target=call_claude, daemon=True)
+            worker.start()
+            self.assertTrue(_HeldOpenClaudeAndCodexHandler.terminal_sent.wait(timeout=3))
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive(), "Claude response waited for upstream EOF")
+            self.assertEqual(result["status"], 200)
+            self.assertTrue(result["body"].endswith(b'event: message_stop\ndata: {"type":"message_stop"}\n\n'))
+            self.assertEqual(_HeldOpenClaudeAndCodexHandler.claude_body, b'{"stream":true}')
+            self.assertTrue(_HeldOpenClaudeAndCodexHandler.claude_auth_present)
+
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            connection.request("POST", "/v1/responses", body=b'{}', headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"{}")
+            connection.close()
+
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            connection.request("HEAD", "/api/hello")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 204)
+            self.assertEqual(response.read(), b"")
+            connection.close()
+        finally:
+            _HeldOpenClaudeAndCodexHandler.release.set()
+            server.shutdown()
+            server.server_close()
+            bridge_thread.join(timeout=5)
+            temporary_policy.cleanup()
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+    def test_claude_429_is_passed_through_without_local_retry(self) -> None:
+        _Claude429Handler.requests = 0
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Claude429Handler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        server, bridge_thread, temporary_policy = start_bridge(upstream.server_port)
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            connection.request("POST", "/v1/messages", body=b"{}")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 429)
+            self.assertEqual(response.getheader("Retry-After"), "2")
+            self.assertIn(b"Service Unavailable", response.read())
+            self.assertEqual(_Claude429Handler.requests, 1)
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            bridge_thread.join(timeout=5)
+            temporary_policy.cleanup()
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+    def test_claude_premature_eof_is_visible_as_sse_error(self) -> None:
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _IncompleteClaudeHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        server, bridge_thread, temporary_policy = start_bridge(upstream.server_port)
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            connection.request("POST", "/v1/messages", body=b"{}")
+            response = connection.getresponse()
+            body = response.read()
+            self.assertEqual(response.status, 200)
+            self.assertIn(b"event: message_start", body)
+            self.assertIn(b"event: error", body)
+            self.assertIn(b"upstream_ended_before_message_stop", body)
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            bridge_thread.join(timeout=5)
+            temporary_policy.cleanup()
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+    def test_converted_claude_error_ends_without_waiting_for_upstream_eof(self) -> None:
+        _HeldOpenClaudeErrorHandler.terminal_sent = threading.Event()
+        _HeldOpenClaudeErrorHandler.release = threading.Event()
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _HeldOpenClaudeErrorHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        server, bridge_thread, temporary_policy = start_bridge(upstream.server_port)
+        try:
+            result: dict[str, object] = {}
+
+            def call_claude() -> None:
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+                try:
+                    connection.request("POST", "/v1/messages", body=b'{}')
+                    response = connection.getresponse()
+                    result["status"] = response.status
+                    result["body"] = response.read()
+                finally:
+                    connection.close()
+
+            worker = threading.Thread(target=call_claude, daemon=True)
+            worker.start()
+            self.assertTrue(_HeldOpenClaudeErrorHandler.terminal_sent.wait(timeout=3))
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive(), "Claude error response waited for upstream EOF")
+            self.assertEqual(result["status"], 200)
+            self.assertIn(b'event: error\ndata: {"type":"error"', result["body"])
+            self.assertNotIn(b"message_stop", result["body"])
+        finally:
+            _HeldOpenClaudeErrorHandler.release.set()
+            server.shutdown()
+            server.server_close()
+            bridge_thread.join(timeout=5)
+            temporary_policy.cleanup()
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+class BridgeStallTests(unittest.TestCase):
     def test_upstream_silence_is_recorded_and_stream_is_terminated(self) -> None:
         _StallingResponsesHandler.started = threading.Event()
         _StallingResponsesHandler.release = threading.Event()

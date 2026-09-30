@@ -30,6 +30,7 @@ param(
         "uninstall",
         "start",
         "stop",
+        "restart",
         "repair",
         "backup",
         "restore",
@@ -167,6 +168,67 @@ function Test-BridgePort {
     } catch {
         return $false
     }
+}
+
+function Get-BridgeListenerProcessId {
+    $connection = Get-NetTCPConnection `
+        -State Listen `
+        -LocalPort $BridgePort `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $connection) {
+        return 0
+    }
+    return [int]$connection.OwningProcess
+}
+
+function Wait-BridgePortState {
+    param(
+        [Parameter(Mandatory)][bool]$Listening,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Test-BridgePort) -ne $Listening) {
+        if ((Get-Date) -ge $deadline) {
+            return $false
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    return $true
+}
+
+function Get-BridgeInfo {
+    if (-not (Test-BridgePort)) {
+        return $null
+    }
+    try {
+        return Invoke-RestMethod `
+            -Uri "http://127.0.0.1:$BridgePort/__bridge/info" `
+            -TimeoutSec 5
+    } catch {
+        return $null
+    }
+}
+
+function Wait-BridgeReady {
+    param([Parameter(Mandatory)][int]$TimeoutSeconds)
+
+    if (-not (Wait-BridgePortState -Listening $true -TimeoutSeconds $TimeoutSeconds)) {
+        return $false
+    }
+    return $null -ne (Get-BridgeInfo)
+}
+
+function Write-BridgeRuntime {
+    param([Parameter(Mandatory)][string]$Status)
+
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Write-Output "status=$Status"
+    Write-Output "task=$TaskName"
+    Write-Output "task_state=$(if ($task) { $task.State } else { '' })"
+    Write-Output "bridge_url=$BridgeUrl"
+    Write-Output "bridge_pid=$(Get-BridgeListenerProcessId)"
 }
 
 function Write-RuntimePolicy {
@@ -737,12 +799,17 @@ switch ($Action) {
         Write-Output "pre_restore_snapshot=$($result.PreRestoreSnapshotId)"
     }
     "start" {
+        if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+            throw "Bridge task $TaskName is not installed; run -Action install first"
+        }
         Start-ScheduledTask -TaskName $TaskName
         if (Get-ScheduledTask -TaskName $AutomationTaskName -ErrorAction SilentlyContinue) {
             Start-ScheduledTask -TaskName $AutomationTaskName
         }
-        Write-Output "status=start_requested"
-        Write-Output "task=$TaskName"
+        if (-not (Wait-BridgeReady -TimeoutSeconds 30)) {
+            throw "Bridge did not become ready on port $BridgePort"
+        }
+        Write-BridgeRuntime -Status "started"
     }
     "stop" {
         if (Get-ScheduledTask -TaskName $AutomationTaskName -ErrorAction SilentlyContinue) {
@@ -751,6 +818,23 @@ switch ($Action) {
         Stop-ScheduledTask -TaskName $TaskName
         Write-Output "status=stop_requested"
         Write-Output "task=$TaskName"
+    }
+    "restart" {
+        if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+            throw "Bridge task $TaskName is not installed; run -Action install first"
+        }
+        # Only the bridge task is touched; the automation task is periodic and
+        # resumes on its own trigger.
+        Stop-ScheduledTask -TaskName $TaskName
+        if (-not (Wait-BridgePortState -Listening $false -TimeoutSeconds 20)) {
+            $owner = Get-BridgeListenerProcessId
+            throw "Port $BridgePort is still in use after stopping $TaskName (pid $owner is not owned by the task)"
+        }
+        Start-ScheduledTask -TaskName $TaskName
+        if (-not (Wait-BridgeReady -TimeoutSeconds 30)) {
+            throw "Bridge did not become ready on port $BridgePort"
+        }
+        Write-BridgeRuntime -Status "restarted"
     }
     "repair" {
         Write-RuntimePolicy `
