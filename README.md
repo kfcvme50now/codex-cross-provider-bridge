@@ -279,7 +279,7 @@ Provider，而不必强制修改历史数据库。
 - 请求转发前先写入在途记录（`inFlight`），因此卡住时状态文件不再是空的；
 - 支持 Codex 当前使用的 `Content-Encoding: zstd`（以及 gzip），解压后才做 JSON
   修复；未知编码返回结构化 HTTP 400，不再用会触发 Codex 连续重试的 415；
-- 超过首包阈值（`--upstream-header-timeout`，默认 120 秒）没有响应头时，返回
+- 超过首包阈值（`--upstream-header-timeout`，默认 600 秒）没有响应头时，返回
   504 并记录 `upstream-headers-timeout`；
 - 超过空闲阈值（`--upstream-idle-timeout`，默认 120 秒）没有任何响应数据时，
   向 SSE 流写入一个 `error` 事件后关闭连接，并记录 `upstream-idle-timeout`；
@@ -353,8 +353,10 @@ python .\src\codex_ccswitch_provider_policy.py `
   --provider-id "<provider-id>" --enable --apply
 ```
 
-阈值按实测留出余量：50 万 token 上下文、`reasoning.effort=high` 的正常请求，
-最长静默约 12 秒，整次请求约 20 秒。被中止的请求在 Codex 侧显示
+阈值按实测留出余量。正常请求（50 万 token 上下文、`reasoning.effort=high`）
+最长静默约 12 秒，整次请求约 20 秒，因此空闲阈值保持 120 秒；远程压缩
+（remote compaction）在官方后端首包实测需要 90–200 秒，因此首包阈值默认
+600 秒。被中止的请求在 Codex 侧显示
 `stream disconnected before completion` 或明确的 Provider 错误，而不是无限等待。
 两个阈值都是秒数，设为 `0` 表示关闭该限制。修改后需要重启 Bridge 任务：
 

@@ -173,5 +173,6 @@ conversation_history_repair_required
 - `in_flight_request_count`：仍在转发中的请求数量；大于 0 时还会输出
   `in_flight_request=<path> started_at=<时间戳>`。
 
-上游停滞阈值由 Bridge 启动参数控制（首包默认 120 秒，空闲默认 120 秒，`0`
+上游停滞阈值由 Bridge 启动参数控制（首包默认 600 秒，为远程压缩 90–200 秒的
+首包耗时留出余量；空闲默认 120 秒；`0`
 表示关闭），详见 [`../README.md`](../README.md) 的“上游停滞保护”。
