@@ -37,6 +37,8 @@ DEFAULT_LIFECYCLE_POLICY = {
     "sessionStartMode": "repair",
     "routeRepairMode": "repair",
     "probeTimeoutSeconds": 30,
+    "officialBridgeEnabled": False,
+    "portableHistoryViaBridge": False,
 }
 
 
@@ -60,6 +62,9 @@ def _normalize_policy(payload: object) -> dict:
         raise ValueError("Invalid compactRepairMode")
     if not isinstance(policy["autoBranchEnabled"], bool):
         raise ValueError("autoBranchEnabled must be a boolean")
+    for key in ("officialBridgeEnabled", "portableHistoryViaBridge"):
+        if not isinstance(policy[key], bool):
+            raise ValueError(f"{key} must be a boolean")
     if policy["branchBackend"] not in BRANCH_BACKENDS:
         raise ValueError("Invalid branchBackend")
     if policy["postSwitchProbeMode"] not in PROBE_MODES:

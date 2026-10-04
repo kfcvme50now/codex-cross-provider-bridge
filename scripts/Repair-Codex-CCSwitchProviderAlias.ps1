@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$ConfigPath = "$env:USERPROFILE\.codex\config.toml",
+    [string]$ConfigPath = $(Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }) "config.toml"),
     [string]$LegacyProviderId = "cc-switch-official",
-    [string]$BridgeUrl = ""
+    [string]$BridgeUrl = "",
+    [string]$CcSwitchUrl = $(if ($env:CODEX_BRIDGE_UPSTREAM_URL) { $env:CODEX_BRIDGE_UPSTREAM_URL.TrimEnd("/") + $(if (([uri]$env:CODEX_BRIDGE_UPSTREAM_URL).AbsolutePath.TrimEnd("/") -eq "") { "/v1" } else { "" }) } else { "http://127.0.0.1:15721/v1" })
 )
 
 . (Join-Path $PSScriptRoot "CodexCrossProviderBridge.Common.ps1")
@@ -20,7 +21,7 @@ if ($BridgeUrl) {
         throw "BridgeUrl must be a loopback http:// URL ending in /v1"
     }
     $updated = $updated -replace (
-        'base_url\s*=\s*"http://127\.0\.0\.1:15721/v1"'
+        ('base_url\s*=\s*"' + [regex]::Escape($CcSwitchUrl) + '"')
     ), "base_url = `"$BridgeUrl`""
 }
 

@@ -41,6 +41,7 @@ param(
         "start",
         "stop",
         "restart",
+        "foreground",
         "restore-route",
         "repair",
         "backup",
@@ -65,9 +66,10 @@ param(
         "status"
     )]
     [string]$Action = "status",
-    [string]$CodexHome = (Join-Path $env:USERPROFILE ".codex"),
-    [int]$BridgePort = 15722,
-    [string]$UpstreamUrl = "http://127.0.0.1:15721",
+    [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }),
+    [int]$BridgePort = $(if ($env:CODEX_BRIDGE_URL) { ([uri]$env:CODEX_BRIDGE_URL).Port } else { 15722 }),
+    [string]$UpstreamUrl = $(if ($env:CODEX_BRIDGE_UPSTREAM_URL) { $env:CODEX_BRIDGE_UPSTREAM_URL } else { "http://127.0.0.1:15721" }),
+    [string]$CcSwitchDatabase = "",
     [ValidateSet("all", "next", "conversation")]
     [string]$RuntimeScope = "all",
     [ValidateSet("all", "conversation", "none")]
@@ -79,7 +81,7 @@ param(
     [string]$SnapshotId = "",
     [switch]$RestoreCcSwitchSettings,
     [ValidateSet("none", "all", "conversation")]
-    [string]$AutoHistoryScope = "all",
+    [string]$AutoHistoryScope = "none",
     [ValidateRange(0, [int]::MaxValue)]
     [int]$AutoIdleSeconds = 300,
     [ValidateRange(1, [int]::MaxValue)]
@@ -89,9 +91,9 @@ param(
     [switch]$IncludeCurrentConversation,
     [string]$MigrationBackupDirectory = "",
     [ValidateSet("disabled", "cli", "app-server")]
-    [string]$PostSwitchProbeMode = "cli",
+    [string]$PostSwitchProbeMode = "disabled",
     [ValidateSet("preserve", "next", "all")]
-    [string]$PostSwitchScope = "next",
+    [string]$PostSwitchScope = "preserve",
     [ValidateRange(1, 300)]
     [int]$ProbeTimeoutSeconds = 30,
     [ValidateSet(
@@ -142,7 +144,10 @@ $RepairScript = Join-Path $PSScriptRoot "Repair-Codex-CCSwitchProviderAlias.ps1"
 $AuditScript = Join-Path (Split-Path $PSScriptRoot -Parent) "src\codex_history_audit.py"
 $MigrateScript = Join-Path (Split-Path $PSScriptRoot -Parent) "src\codex_thread_provider_migrate.py"
 $TemplateGuardScript = Join-Path (Split-Path $PSScriptRoot -Parent) "src\codex_ccswitch_template_guard.py"
-$CcSwitchDatabase = Join-Path $env:USERPROFILE ".cc-switch\cc-switch.db"
+if (-not $CcSwitchDatabase) {
+    $ccHome = if ($env:CC_SWITCH_HOME) { $env:CC_SWITCH_HOME } else { Join-Path $env:USERPROFILE ".cc-switch" }
+    $CcSwitchDatabase = if ($env:CC_SWITCH_DB) { $env:CC_SWITCH_DB } else { Join-Path $ccHome "cc-switch.db" }
+}
 if (-not $ConfigPath) {
     $ConfigPath = Join-Path $CodexHome "config.toml"
 }
@@ -170,7 +175,7 @@ if (-not (Test-Path -LiteralPath $BridgeScript -PathType Leaf)) {
 function Get-PythonPath {
     $python = Get-Command python -ErrorAction SilentlyContinue
     if (-not $python) {
-        throw "Python 3.10+ is required but python was not found on PATH"
+        throw "Python 3.11+ is required but python was not found on PATH"
     }
     return $python.Source
 }
@@ -233,7 +238,37 @@ function Wait-BridgeReady {
     if (-not (Wait-BridgePortState -Listening $true -TimeoutSeconds $TimeoutSeconds)) {
         return $false
     }
-    return $null -ne (Get-BridgeInfo)
+    $first = Get-BridgeInfo
+    if (-not $first -or -not $first.pid -or $first.statusFile -ne $StatusFile) { return $false }
+    Start-Sleep -Seconds 2
+    $second = Get-BridgeInfo
+    return $null -ne $second -and $second.pid -eq $first.pid -and $second.statusFile -eq $StatusFile
+}
+
+function Stop-ManagedBridge {
+    $owner = Get-BridgeListenerProcessId
+    if ($owner) {
+        $info = Get-BridgeInfo
+        if ($info -and $info.activeRequests -gt 0) {
+            throw "Bridge has active requests; wait for them to complete before restarting."
+        }
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$owner"
+        if (-not $process -or $process.Name -notmatch '^python(w)?\.exe$' -or
+            -not $process.CommandLine.Contains($BridgeScript) -or
+            -not $process.CommandLine.Contains("--listen 127.0.0.1:$BridgePort")) {
+            throw "Port $BridgePort belongs to an unmanaged process (pid=$owner); leaving it running."
+        }
+    }
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Add-Content -LiteralPath (Join-Path $BridgeStateDirectory 'bridge-runtime.log') -Value "$(Get-Date -Format o) manager stop requested task=$TaskName listener_pid=$owner" -ErrorAction SilentlyContinue
+        Stop-ScheduledTask -TaskName $TaskName
+    }
+    if ($owner -and (Get-BridgeListenerProcessId) -eq $owner) {
+        Stop-Process -Id $owner -ErrorAction Stop
+    }
+    if (-not (Wait-BridgePortState -Listening $false -TimeoutSeconds 20)) {
+        throw "Bridge port $BridgePort did not close."
+    }
 }
 
 function Write-BridgeRuntime {
@@ -525,6 +560,8 @@ function Set-LifecyclePolicy {
             -PolicyPath $LifecyclePolicyFile `
             -StatusFile $LifecycleStatusFile `
             -CompactMode $CompactHookMode `
+            -OfficialBridgeEnabled true `
+            -PortableHistoryViaBridge true `
             -AutoBranch ([string]$AllowAutoBranch).ToLowerInvariant() `
             -BranchBackend $BranchBackend `
             -PostSwitchProbeMode $PostSwitchProbeMode `
@@ -553,6 +590,8 @@ function Install-LifecycleHook {
     try {
         & $LifecycleManager `
             -Action install-hooks `
+            -CcSwitchDatabase $CcSwitchDatabase `
+            -UpstreamUrl $UpstreamUrl `
             -CodexHome $CodexHome `
             -ConfigPath $ConfigPath `
             -PolicyPath $LifecyclePolicyFile `
@@ -738,8 +777,11 @@ function Restore-DefaultCodexRoute {
     if ($provider.PSObject.Properties["supportsWebsockets"] -and [bool]$provider.supportsWebsockets) {
         $websockets = "true"
     }
-    if ($baseUrl -notmatch '^http://127\.0\.0\.1:\d+/v1$') {
-        throw "Default route profile baseUrl must be a loopback http:// URL ending in /v1"
+    if (-not $baseUrl) {
+        $baseUrl = if ($providerName -eq "OpenAI") { "http://127.0.0.1:$BridgePort/__codex_official__" } else { $BridgeUrl }
+    }
+    if ($baseUrl -notmatch '^http://127\.0\.0\.1:\d+/(v1|__codex_official__)$') {
+        throw "Default route profile baseUrl must be a loopback HTTP URL ending in /v1 or /__codex_official__"
     }
     if (-not $providerName -or -not $wireApi) {
         throw "Default route profile provider block needs name and wireApi"
@@ -757,7 +799,7 @@ function Restore-DefaultCodexRoute {
     if ($blockMatch.Success) {
         $block = $blockMatch.Value
         if ($block -match '(?m)^base_url\s*=') {
-            $newBlock = [regex]::Replace($block, '(?m)^base_url\s*=.*$', "base_url = `"$baseUrl`"", 1)
+            $newBlock = [regex]::Replace($block, '(?m)^base_url[ \t]*=[^\r\n]*', "base_url = `"$baseUrl`"", 1)
         } else {
             $newBlock = $block.TrimEnd("`r", "`n") + "`r`n" + "base_url = `"$baseUrl`"`r`n"
         }
@@ -776,9 +818,9 @@ supports_websockets = $websockets
     }
 
     if ($updated -match '(?m)^model_provider\s*=') {
-        $updated = [regex]::Replace($updated, '(?m)^model_provider\s*=.*$', "model_provider = `"$providerId`"", 1)
+        $updated = [regex]::Replace($updated, '(?m)^model_provider[ \t]*=[^\r\n]*', "model_provider = `"$providerId`"", 1)
     } elseif ($updated -match '(?m)^model\s*=') {
-        $updated = [regex]::Replace($updated, '(?m)^(model\s*=.*)$', "`$1`r`nmodel_provider = `"$providerId`"", 1)
+        $updated = [regex]::Replace($updated, '(?m)^(model[ \t]*=[^\r\n]*)', "`$1`r`nmodel_provider = `"$providerId`"", 1)
     } else {
         $updated = "model_provider = `"$providerId`"`r`n" + $updated
     }
@@ -823,9 +865,10 @@ function Repair-HistoricalProviderAlias {
     }
 
     if ($HistoryScope -eq "all") {
-        & $RepairScript -ConfigPath $ConfigPath -BridgeUrl $BridgeUrl
+        & $RepairScript -ConfigPath $ConfigPath -BridgeUrl $BridgeUrl -CcSwitchUrl ($UpstreamUrl.TrimEnd("/") + $(if (([uri]$UpstreamUrl).AbsolutePath.TrimEnd("/") -eq "") { "/v1" } else { "" }))
         & $RepairScript `
             -ConfigPath $ConfigPath `
+            -CcSwitchUrl ($UpstreamUrl.TrimEnd("/") + $(if (([uri]$UpstreamUrl).AbsolutePath.TrimEnd("/") -eq "") { "/v1" } else { "" })) `
             -LegacyProviderId "custom" `
             -BridgeUrl $BridgeUrl
 
@@ -941,7 +984,7 @@ switch ($Action) {
         if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
             throw "Bridge task $TaskName is not installed; run -Action install first"
         }
-        Start-ScheduledTask -TaskName $TaskName
+        if (-not (Test-BridgePort)) { Start-ScheduledTask -TaskName $TaskName }
         if (Get-ScheduledTask -TaskName $AutomationTaskName -ErrorAction SilentlyContinue) {
             Start-ScheduledTask -TaskName $AutomationTaskName
         }
@@ -962,21 +1005,32 @@ switch ($Action) {
         if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
             throw "Bridge task $TaskName is not installed; run -Action install first"
         }
-        # The Codex route is restored from the tracked default profile before the
-        # bridge comes back; a running Codex picks it up on its next start.
-        Restore-DefaultCodexRoute
+        # Restart only the service. Restoring the old pinned route here silently
+        # moved native OpenAI (and web chat) onto an inactive CC Switch takeover.
+        # Route restoration remains an explicit -Action restore-route operation.
         # Only the bridge task is touched; the automation task is periodic and
         # resumes on its own trigger.
-        Stop-ScheduledTask -TaskName $TaskName
-        if (-not (Wait-BridgePortState -Listening $false -TimeoutSeconds 20)) {
-            $owner = Get-BridgeListenerProcessId
-            throw "Port $BridgePort is still in use after stopping $TaskName (pid $owner is not owned by the task)"
-        }
+        Stop-ManagedBridge
         Start-ScheduledTask -TaskName $TaskName
         if (-not (Wait-BridgeReady -TimeoutSeconds 30)) {
             throw "Bridge did not become ready on port $BridgePort"
         }
         Write-BridgeRuntime -Status "restarted"
+    }
+    "foreground" {
+        Stop-ManagedBridge
+        Write-Host "Codex Bridge runs in this window. Closing it stops port $BridgePort."
+        Write-Host "Restart does not restore the default provider. Configured route maintenance remains active."
+        Write-Host "Runtime log: $(Join-Path $BridgeStateDirectory 'bridge-runtime.log')"
+        $python = Get-PythonPath
+        $bridgeArguments = @('-u', $BridgeScript, '--listen', "127.0.0.1:$BridgePort", '--upstream', $UpstreamUrl,
+            '--policy-file', $PolicyFile, '--status-file', $StatusFile, '--codex-home', $CodexHome,
+            '--cc-switch-db', $CcSwitchDatabase, '--provider-max-attempts', "$ProviderMaxAttempts",
+            '--provider-retry-backoff-seconds', $ProviderRetryBackoffSeconds.ToString([Globalization.CultureInfo]::InvariantCulture))
+        foreach ($route in $ProviderRoute) { $bridgeArguments += @('--provider-route', $route) }
+        foreach ($credential in $ProviderRouteBearerEnv) { $bridgeArguments += @('--provider-route-bearer-env', $credential) }
+        & $python @bridgeArguments
+        if ($LASTEXITCODE -ne 0) { throw "Bridge exited with code $LASTEXITCODE; inspect bridge-runtime.log" }
     }
     "restore-route" {
         Restore-DefaultCodexRoute

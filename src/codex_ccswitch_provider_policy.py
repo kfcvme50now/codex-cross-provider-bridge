@@ -8,6 +8,7 @@ import json
 import shutil
 import sqlite3
 import time
+from codex_bridge_environment import default_cc_switch_db
 from pathlib import Path
 
 
@@ -113,7 +114,7 @@ def main() -> int:
     parser.add_argument(
         "--database",
         type=Path,
-        default=Path.home() / ".cc-switch" / "cc-switch.db",
+        default=default_cc_switch_db(),
     )
     parser.add_argument("--provider-id", required=True)
     action = parser.add_mutually_exclusive_group(required=True)
@@ -124,7 +125,7 @@ def main() -> int:
     parser.add_argument(
         "--backup-root",
         type=Path,
-        default=Path.home() / ".cc-switch" / "backups" / "provider-routing-policy",
+        default=default_cc_switch_db().parent / "backups" / "provider-routing-policy",
     )
     args = parser.parse_args()
 

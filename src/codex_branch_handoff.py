@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+from codex_bridge_environment import default_codex_home, default_config_path
 from pathlib import Path
 from typing import Callable
 
@@ -248,10 +249,10 @@ def run_branch_handoff(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument(
         "--config",
-        default=str(Path.home() / ".codex" / "config.toml"),
+        default=str(default_config_path()),
     )
     parser.add_argument("--conversation-id", default="")
     parser.add_argument("--target-provider", default="")

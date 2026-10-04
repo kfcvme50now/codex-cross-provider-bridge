@@ -13,6 +13,8 @@ import gzip
 import http.client
 import io
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import signal
@@ -23,8 +25,12 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from codex_bridge_environment import default_codex_home, default_cc_switch_db
+from codex_bridge_environment import default_bridge_url, default_cc_switch_url
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
+from urllib.request import getproxies, proxy_bypass
+import base64
 
 try:
     import zstandard
@@ -50,18 +56,18 @@ PORTABILITY_ERROR_MARKERS = (
     b"array too long",
 )
 MAX_BODY_BYTES = 256 * 1024 * 1024
-MAX_CLAUDE_SSE_FRAME_BYTES = 4 * 1024 * 1024
 # Remote compaction on the ChatGPT backend routinely needs 90-200s to first byte.
 DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS = 600
 DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS = 120
+DEFAULT_COMPACT_IDLE_TIMEOUT_SECONDS = 600
 DEFAULT_PROVIDER_CIRCUIT_SECONDS = 60
 DEFAULT_STATE_DIRECTORY = Path(__file__).resolve().parents[1] / "state"
 DEFAULT_POLICY_FILE = DEFAULT_STATE_DIRECTORY / "policy.json"
 DEFAULT_STATUS_FILE = DEFAULT_STATE_DIRECTORY / "status.json"
-DEFAULT_CC_SWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
-DEFAULT_PRESERVE_STATE_PROVIDER_IDS = ("default", "anyrouter-codex-gpt6")
+DEFAULT_CC_SWITCH_DB = default_cc_switch_db()
+DEFAULT_PRESERVE_STATE_PROVIDER_IDS = ()
 DEFAULT_HEALTH_GUARD_PROVIDER_IDS: tuple[str, ...] = ()
-DEFAULT_RETRY_PROVIDER_IDS = ("anyrouter-codex-gpt6",)
+DEFAULT_RETRY_PROVIDER_IDS = ()
 DEFAULT_PROVIDER_MAX_ATTEMPTS = 3
 DEFAULT_PROVIDER_RETRY_BACKOFF_SECONDS = 0.5
 REQUEST_LOG_NAME = "request-log.jsonl"
@@ -94,41 +100,6 @@ UPSTREAM_PROVIDER_ERROR_CODES = frozenset(
 CLIENT_REQUEST_ERROR_CODES = frozenset({"cc_switch_invalid_request"})
 
 
-class ClaudeSseFramer:
-    """Keep complete Anthropic SSE frames and identify the protocol terminal event."""
-
-    def __init__(self) -> None:
-        self.buffer = bytearray()
-
-    def push(self, chunk: bytes) -> list[tuple[bytes, str]]:
-        self.buffer.extend(chunk)
-        frames: list[tuple[bytes, str]] = []
-        while match := re.search(rb"\r?\n\r?\n", self.buffer):
-            if match.end() > MAX_CLAUDE_SSE_FRAME_BYTES:
-                raise ValueError("Claude SSE frame exceeds the local size limit")
-            frame = bytes(self.buffer[: match.end()])
-            del self.buffer[: match.end()]
-            event_type = ""
-            data_lines: list[bytes] = []
-            for line in frame.splitlines():
-                if line.startswith(b"event:"):
-                    event_type = line[6:].strip().decode("ascii", errors="ignore")
-                elif line.startswith(b"data:"):
-                    data_lines.append(line[5:].lstrip())
-            if not event_type and data_lines:
-                try:
-                    payload = json.loads(b"\n".join(data_lines))
-                    if isinstance(payload, dict):
-                        event_type = str(payload.get("type") or "")
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    pass
-            frames.append((frame, event_type))
-            if event_type == "message_stop":
-                self.buffer.clear()
-                break
-        if len(self.buffer) > MAX_CLAUDE_SSE_FRAME_BYTES:
-            raise ValueError("Claude SSE frame exceeds the local size limit")
-        return frames
 
 
 @dataclass
@@ -248,6 +219,42 @@ def classify_request_source(headers: Mapping[str, str]) -> tuple[str, str]:
     if not label:
         label = "unknown"
     return label[:MAX_CLIENT_LABEL_CHARS], user_agent[:MAX_USER_AGENT_CHARS]
+
+
+def request_client_kind(headers: Mapping[str, str]) -> str:
+    """Scope compatibility repair to native clients, never browser/web chat."""
+    values = {key.lower(): value for key, value in headers.items()}
+    user_agent = str(values.get("user-agent", "")).lower()
+    if "mozilla/" in user_agent or str(values.get("origin", "")).startswith(("https://", "http://")):
+        return "browser"
+    source, _ = classify_request_source(values)
+    if source.lower() in {"codex_cli_rs", "codex_app", "codex_desktop", "codex_desktop_rs", "codex_app_server", "codex desktop", "codex"}:
+        return "codex"
+    if user_agent.startswith(("claude-cli/", "claude-code/")):
+        return "claude"
+    return "unknown"
+
+
+def https_transport_connection(upstream: SplitResult, timeout: float | None) -> http.client.HTTPSConnection:
+    """Use the configured system proxy for HTTPS; keep TLS verification enabled."""
+    host = upstream.hostname or ""
+    port = upstream.port or 443
+    proxy_url = None
+    if host not in {"127.0.0.1", "localhost", "::1"} and not proxy_bypass(host):
+        proxy_url = getproxies().get("https")
+    if not proxy_url:
+        return http.client.HTTPSConnection(host, port, timeout=timeout)
+    proxy = urlsplit(proxy_url if "://" in proxy_url else "http://" + proxy_url)
+    if proxy.scheme != "http" or not proxy.hostname:
+        raise OSError("Configured HTTPS transport requires a supported HTTP CONNECT proxy")
+    connection = http.client.HTTPSConnection(proxy.hostname, proxy.port or 80, timeout=timeout)
+    tunnel_headers = {}
+    if proxy.username is not None:
+        from urllib.parse import unquote
+        credential = unquote(proxy.username) + ":" + unquote(proxy.password or "")
+        tunnel_headers["Proxy-Authorization"] = "Basic " + base64.b64encode(credential.encode()).decode()
+    connection.set_tunnel(host, port, headers=tunnel_headers)
+    return connection
 
 
 def lookup_provider(
@@ -629,6 +636,9 @@ def make_portable_payload(payload: object) -> tuple[object, SanitizeReport]:
 
 def is_retryable_portability_error(status: int, body: bytes) -> bool:
     """Recognize only explicit history-portability HTTP 400 responses."""
+    if status == 404:
+        lowered = body.lower()
+        return b"item with id" in lowered and b"not found" in lowered and b"store" in lowered
     if status != 400:
         return False
 
@@ -661,8 +671,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     server_version = "CodexCrossProviderBridge/1.0"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
-        sys.stderr.flush()
+        logging.getLogger("codex.bridge").info(fmt, *args)
 
     def _read_request_body(self) -> bytes | None:
         length_text = self.headers.get("Content-Length", "0") or "0"
@@ -686,17 +695,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
         upstream: SplitResult | None = None,
     ) -> tuple[http.client.HTTPResponse, http.client.HTTPConnection]:
         upstream = upstream or self.server.upstream  # type: ignore[attr-defined]
-        connection_class = (
-            http.client.HTTPSConnection
-            if upstream.scheme == "https"
-            else http.client.HTTPConnection
-        )
         port = upstream.port or (443 if upstream.scheme == "https" else 80)
         header_timeout = self.server.upstream_header_timeout  # type: ignore[attr-defined]
-        connection = connection_class(
-            upstream.hostname,
-            port,
-            timeout=header_timeout or None,
+        connection = (
+            https_transport_connection(upstream, header_timeout or None)
+            if upstream.scheme == "https"
+            else http.client.HTTPConnection(upstream.hostname, port, timeout=header_timeout or None)
         )
         try:
             connection.request(method, path, body=body or None, headers=headers)
@@ -709,6 +713,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             connection.close()
             raise
         idle_timeout = self.server.upstream_idle_timeout  # type: ignore[attr-defined]
+        if urlsplit(path).path.rstrip("/").endswith("/responses/compact") or getattr(self, "compaction_request", False):
+            idle_timeout = self.server.upstream_compact_idle_timeout
         if upstream_socket is not None:
             upstream_socket.settimeout(idle_timeout or None)
         return response, connection
@@ -716,6 +722,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _build_upstream_path(self, upstream: SplitResult | None = None) -> str:
         upstream = upstream or self.server.upstream  # type: ignore[attr-defined]
         incoming = urlsplit(self.path)
+        if getattr(self, "official_route", False):
+            return upstream.path.rstrip("/") + incoming.path[len("/__codex_official__"):] + ("?" + incoming.query if incoming.query else "")
         base_path = upstream.path.rstrip("/")
         if base_path and (
             incoming.path == base_path or incoming.path.startswith(base_path + "/")
@@ -995,130 +1003,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return "client-aborted", {"bytesRelayed": bytes_relayed}
 
-    def _claude_stream_error(self, code: str) -> None:
-        payload = json.dumps(
-            {
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": f"Local Claude bridge: {code}",
-                },
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-        try:
-            self.wfile.write(b"event: error\ndata: " + payload + b"\n\n")
-            self.wfile.flush()
-        except OSError:
-            pass
 
-    def _forward_claude_stream(
-        self, response: http.client.HTTPResponse
-    ) -> tuple[str, int]:
-        self.send_response(response.status, response.reason)
-        for key, value in response.getheaders():
-            if key.lower() not in HOP_BY_HOP | {"content-length"}:
-                self.send_header(key, value)
-        self.send_header("Connection", "close")
-        self.end_headers()
 
-        framer = ClaudeSseFramer()
-        bytes_relayed = 0
-        while True:
-            try:
-                chunk = response.read1(65536)
-                if not chunk:
-                    self._claude_stream_error("upstream_ended_before_message_stop")
-                    self.close_connection = True
-                    return "upstream-ended-before-message-stop", bytes_relayed
-                frames = framer.push(chunk)
-                for frame, event_type in frames:
-                    self.wfile.write(frame)
-                    self.wfile.flush()
-                    bytes_relayed += len(frame)
-                    if event_type == "error":
-                        self.close_connection = True
-                        return "upstream-error-event", bytes_relayed
-                    if event_type == "message_stop":
-                        self.close_connection = True
-                        return "completed-at-message-stop", bytes_relayed
-            except ValueError:
-                self._claude_stream_error("oversized_sse_frame")
-                self.close_connection = True
-                return "oversized-sse-frame", bytes_relayed
-            except TimeoutError:
-                self._claude_stream_error("upstream_idle_timeout")
-                self.close_connection = True
-                return "upstream-idle-timeout", bytes_relayed
-            except (OSError, http.client.HTTPException) as exc:
-                if isinstance(exc, OSError) and isinstance(exc, (BrokenPipeError, ConnectionResetError)):
-                    self.close_connection = True
-                    return "client-aborted", bytes_relayed
-                self._claude_stream_error("upstream_stream_error")
-                self.close_connection = True
-                return "upstream-error", bytes_relayed
-
-    def _handle_claude_messages(self) -> None:
-        body = self._read_request_body()
-        if body is None:
-            return
-        headers = {
-            key: value
-            for key, value in self.headers.items()
-            if key.lower() not in HOP_BY_HOP
-            and key.lower() not in {"host", "content-length", "accept-encoding"}
-        }
-        headers["Content-Length"] = str(len(body))
-        headers["Accept-Encoding"] = "identity"
-        connection: http.client.HTTPConnection | None = None
-        try:
-            response, connection = self._forward(
-                self.command, self._build_upstream_path(), body, headers
-            )
-            content_type = (response.getheader("Content-Type") or "").lower()
-            content_encoding = (response.getheader("Content-Encoding") or "").lower()
-            if response.status == 200 and "text/event-stream" in content_type and not content_encoding:
-                outcome, bytes_relayed = self._forward_claude_stream(response)
-            else:
-                outcome, detail = self._forward_response(response)
-                bytes_relayed = int(detail.get("bytesRelayed", 0))
-            self.log_message(
-                "POST /v1/messages -> %d; outcome=%s; bytes_relayed=%d; source=%s",
-                response.status, outcome, bytes_relayed,
-                getattr(self, "request_source", "unknown"),
-            )
-            self._append_request_log(
-                {
-                    "requestPath": "/v1/messages",
-                    "source": getattr(self, "request_source", "unknown"),
-                    "outcome": outcome,
-                    "upstreamStatus": response.status,
-                    "outcomeDetail": {"bytesRelayed": bytes_relayed},
-                }
-            )
-        except TimeoutError:
-            self._send_json_error(504, "upstream_header_timeout", "Claude upstream response headers timed out")
-            self._append_request_log(
-                {
-                    "requestPath": "/v1/messages",
-                    "source": getattr(self, "request_source", "unknown"),
-                    "outcome": "upstream-headers-timeout",
-                    "upstreamStatus": 504,
-                }
-            )
-        except (OSError, http.client.HTTPException) as exc:
-            self._send_json_error(502, "upstream_connection_error", f"Claude upstream connection failed: {type(exc).__name__}")
-            self._append_request_log(
-                {
-                    "requestPath": "/v1/messages",
-                    "source": getattr(self, "request_source", "unknown"),
-                    "outcome": "upstream-connection-error",
-                    "upstreamStatus": 502,
-                }
-            )
-        finally:
-            if connection is not None:
-                connection.close()
 
     def _publish_status(self) -> str:
         """Rewrite the status file from current in-memory bridge state."""
@@ -1195,13 +1081,42 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _handle_untouched_passthrough(self) -> None:
+        """Relay raw bytes without provider lookup, repair, retries, or policy state."""
+        body = self._read_request_body()
+        if body is None:
+            return
+        headers = {key: value for key, value in self.headers.items()
+                   if key.lower() not in HOP_BY_HOP | {"host", "content-length"}}
+        response = connection = None
+        response_started = False
+        try:
+            response, connection = self._forward(self.command, self._build_upstream_path(), body, headers)
+            self.send_response(response.status)
+            for key, value in response.getheaders():
+                if key.lower() not in HOP_BY_HOP:
+                    self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            response_started = True
+            while chunk := response.read1(65536):
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (OSError, http.client.HTTPException):
+            if not response_started:
+                self._send_json_error(502, "transport_error", "The upstream connection failed before a response was received.")
+        finally:
+            if response is not None:
+                response.close()
+            if connection is not None:
+                connection.close()
+            self.close_connection = True
+
     def _handle(self) -> None:
         source, user_agent = classify_request_source(self.headers)
         self.request_source = source
         self.request_user_agent = user_agent
-        if self.command == "POST" and urlsplit(self.path).path == "/v1/messages":
-            self._handle_claude_messages()
-            return
+        kind = request_client_kind(self.headers)
         if urlsplit(self.path).path == "/__bridge/info":
             policy_path = self.server.policy_file  # type: ignore[attr-defined]
             policy = load_policy(policy_path)
@@ -1212,6 +1127,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 policy_file_mtime = policy_path.stat().st_mtime
             body = json.dumps(
                 {
+                    "pid": os.getpid(),
+                    "activeRequests": len(self.server.in_flight),
+                    "compactIdleTimeout": self.server.upstream_compact_idle_timeout,
+                    "claudeSseRepair": False,
+                    "officialCompatibilityRoute": True,
+                    "automaticRouteMaintenance": True,
                     "policyFile": str(policy_path),
                     "policyFileExists": policy_path.exists(),
                     "policyFileMtime": policy_file_mtime,
@@ -1239,6 +1160,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             self.close_connection = True
+            return
+
+        self.official_route = urlsplit(self.path).path.startswith("/__codex_official__/")
+        if self.official_route and kind != "codex":
+            self._send_json_error(403, "native_codex_required", "This route accepts native Codex requests only.")
+            return
+        if kind != "codex":
+            self._handle_untouched_passthrough()
             return
 
         body = self._read_request_body()
@@ -1276,6 +1205,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         provider_selection_source = "header" if selected_provider_id else "default"
         selected_route: ProviderRoute | None = None
         routed_upstream = self.server.upstream  # type: ignore[attr-defined]
+        if self.official_route:
+            # Dedicated native route: never consult CC Switch for credential ownership.
+            routed_upstream = self.server.official_upstream
+            active_provider = ProviderRuntimeState("native-openai", "OpenAI", None, 0, False, "")
+            if selected_provider_id:
+                self._send_json_error(400, "provider_route_conflict", "Official route cannot select another provider.")
+                return
         explicit_model = ""
         if selected_provider_id:
             selected_route = self.server.provider_routes.get(  # type: ignore[attr-defined]
@@ -1305,9 +1241,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if body and "json" in content_type and _is_responses_path(self.path):
             try:
                 original_payload = json.loads(body.decode("utf-8"))
+                self.compaction_request = isinstance(original_payload, dict) and any(
+                    isinstance(item, dict) and item.get("type") == "compaction_trigger"
+                    for item in original_payload.get("input", [])
+                )
                 if isinstance(original_payload, dict):
                     model_before = str(original_payload.get("model") or "")
                     if "::" in model_before:
+                        if self.official_route:
+                            self._send_json_error(400, "provider_route_conflict", "Official route cannot select another provider.")
+                            return
                         model_provider_id, explicit_model = model_before.split("::", 1)
                         model_provider_id = model_provider_id.strip()
                         explicit_model = explicit_model.strip()
@@ -1402,8 +1345,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         and active_provider is not None
                         and active_provider.provider_id in preserve_ids
                     )
+                    # Preserve native encrypted context normally. Synthetic IDs from
+                    # Chat Completions converters must never resolve on OpenAI.
+                    foreign_items = any(
+                        isinstance(item, dict) and str(item.get("id") or "").startswith(
+                            ("rs_resp_", "resp_", "msg__", "fc_call_", "ctc_call_")
+                        ) for item in (original_payload.get("input", []) if isinstance(original_payload, dict) else [])
+                    )
+                    if self.official_route:
+                        provider_state_preserved = not foreign_items
                     if provider_state_preserved:
                         sanitized_payload = original_payload
+                    elif self.official_route and foreign_items:
+                        sanitized_payload, report = make_portable_payload(original_payload)
                     else:
                         sanitized_payload, report = sanitize_payload(original_payload)
                     body = json.dumps(
@@ -1467,6 +1421,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "cwd": conversation_cwd,
             "modelProvider": conversation_provider,
             "conversationModel": conversation_model,
+            "compactionRequest": bool(getattr(self, "compaction_request", False)) or self.path.endswith("/responses/compact"),
             "modelBefore": model_before,
             "modelAfter": model_after,
             "targeted": targeted,
@@ -1668,7 +1623,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
             if (
                 original_payload is not None
-                and upstream_response.status == 400
+                and upstream_response.status in {400, 404}
                 and self.command in {"POST", "PUT", "PATCH"}
             ):
                 first_error = upstream_response.read()
@@ -1909,7 +1864,7 @@ class BridgeServer(ThreadingHTTPServer):
         model_override: str = "",
         policy_file: Path = DEFAULT_POLICY_FILE,
         status_file: Path = DEFAULT_STATUS_FILE,
-        codex_home: Path = Path.home() / ".codex",
+        codex_home: Path = default_codex_home(),
         cc_switch_db: Path = DEFAULT_CC_SWITCH_DB,
         preserve_state_provider_ids: tuple[str, ...] = DEFAULT_PRESERVE_STATE_PROVIDER_IDS,
         health_guard_provider_ids: tuple[str, ...] = DEFAULT_HEALTH_GUARD_PROVIDER_IDS,
@@ -1921,6 +1876,7 @@ class BridgeServer(ThreadingHTTPServer):
         provider_route_bearer_envs: dict[str, str] | None = None,
         upstream_header_timeout: int = DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
         upstream_idle_timeout: int = DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
+        upstream_compact_idle_timeout: int = DEFAULT_COMPACT_IDLE_TIMEOUT_SECONDS,
     ) -> None:
         upstream = urlsplit(upstream_url)
         if upstream.scheme not in {"http", "https"} or not upstream.hostname:
@@ -1928,6 +1884,7 @@ class BridgeServer(ThreadingHTTPServer):
 
         super().__init__(server_address, BridgeHandler)
         self.upstream = upstream
+        self.official_upstream = urlsplit("https://chatgpt.com/backend-api/codex")
         self.model_override = model_override.strip()
         self.policy_file = Path(policy_file)
         self.status_file = Path(status_file)
@@ -1975,6 +1932,7 @@ class BridgeServer(ThreadingHTTPServer):
         self.provider_circuits: dict[str, dict[str, object]] = {}
         self.upstream_header_timeout = max(0, int(upstream_header_timeout))
         self.upstream_idle_timeout = max(0, int(upstream_idle_timeout))
+        self.upstream_compact_idle_timeout = max(0, int(upstream_compact_idle_timeout))
         self.policy_lock = threading.Lock()
         self.metadata_cache: dict[str, tuple[float, dict[str, str]]] = {}
         self.request_count = 0
@@ -2015,7 +1973,7 @@ def create_server(
     model_override: str = "",
     policy_file: Path = DEFAULT_POLICY_FILE,
     status_file: Path = DEFAULT_STATUS_FILE,
-    codex_home: Path = Path.home() / ".codex",
+    codex_home: Path = default_codex_home(),
     cc_switch_db: Path = DEFAULT_CC_SWITCH_DB,
     preserve_state_provider_ids: tuple[str, ...] = DEFAULT_PRESERVE_STATE_PROVIDER_IDS,
     health_guard_provider_ids: tuple[str, ...] = DEFAULT_HEALTH_GUARD_PROVIDER_IDS,
@@ -2027,6 +1985,7 @@ def create_server(
     provider_route_bearer_envs: dict[str, str] | None = None,
     upstream_header_timeout: int = DEFAULT_UPSTREAM_HEADER_TIMEOUT_SECONDS,
     upstream_idle_timeout: int = DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
+    upstream_compact_idle_timeout: int = DEFAULT_COMPACT_IDLE_TIMEOUT_SECONDS,
 ) -> BridgeServer:
     if listen_host not in {"127.0.0.1", "::1", "localhost"}:
         raise ValueError("listen host must be loopback-only")
@@ -2048,6 +2007,7 @@ def create_server(
         provider_route_bearer_envs=provider_route_bearer_envs,
         upstream_header_timeout=upstream_header_timeout,
         upstream_idle_timeout=upstream_idle_timeout,
+        upstream_compact_idle_timeout=upstream_compact_idle_timeout,
     )
 
 
@@ -2069,12 +2029,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Sanitize Codex Responses history before forwarding upstream."
     )
-    parser.add_argument("--listen", default="127.0.0.1:15722")
-    parser.add_argument("--upstream", default="http://127.0.0.1:15721")
+    parser.add_argument("--listen", default=urlsplit(default_bridge_url()).netloc)
+    parser.add_argument("--upstream", default=default_cc_switch_url())
     parser.add_argument("--model-override", default="")
     parser.add_argument("--policy-file", default=str(DEFAULT_POLICY_FILE))
     parser.add_argument("--status-file", default=str(DEFAULT_STATUS_FILE))
-    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument("--cc-switch-db", default=str(DEFAULT_CC_SWITCH_DB))
     parser.add_argument(
         "--preserve-state-provider",
@@ -2106,7 +2066,7 @@ def parse_args() -> argparse.Namespace:
         dest="retry_providers",
         help=(
             "Provider ID allowed bounded retries for transient failures. "
-            "Repeat for multiple providers; defaults to anyrouter-codex-gpt6."
+            "Repeat for multiple providers; disabled by default."
         ),
     )
     parser.add_argument(
@@ -2151,11 +2111,22 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECONDS,
         help="Seconds of upstream silence tolerated mid-stream; 0 disables the limit.",
     )
+    parser.add_argument("--upstream-compact-idle-timeout", type=int, default=DEFAULT_COMPACT_IDLE_TIMEOUT_SECONDS,
+                        help="Body-idle limit for /responses/compact only; 0 disables it.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    log_path = Path(args.status_file).parent / "bridge-runtime.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("codex.bridge")
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s pid=%(process)d %(message)s")
+    for handler in (logging.StreamHandler(), RotatingFileHandler(log_path, maxBytes=4*1024*1024, backupCount=2, encoding="utf-8")):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    logger.info("starting listen=%s upstream=%s", args.listen, args.upstream)
     listen_host, listen_port_text = args.listen.rsplit(":", 1)
     try:
         provider_routes = parse_mapping_options(args.provider_routes, "--provider-route")
@@ -2196,9 +2167,11 @@ def main() -> int:
         provider_route_bearer_envs=provider_route_bearer_envs,
         upstream_header_timeout=args.upstream_header_timeout,
         upstream_idle_timeout=args.upstream_idle_timeout,
+        upstream_compact_idle_timeout=args.upstream_compact_idle_timeout,
     )
 
     def stop(_signum: int, _frame: object) -> None:
+        logger.warning("shutdown requested signal=%s", _signum)
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, stop)
@@ -2207,18 +2180,27 @@ def main() -> int:
 
     print(f"Codex cross-provider bridge listening on http://{args.listen}")
     print(f"Forwarding to {args.upstream}")
+    logger.info("ready listen=%s compact_idle_timeout=%s claude_sse_repair=disabled", args.listen, server.upstream_compact_idle_timeout)
     print(
         "Upstream limits: headers=%ss idle=%ss (0 disables)"
         % (server.upstream_header_timeout, server.upstream_idle_timeout)
     )
     if server.model_override:
         print(f"Rewriting request model to {server.model_override}")
+    from codex_route_projection import start_route_maintenance
+    maintenance_stop = start_route_maintenance(server)
     try:
         server.serve_forever()
     finally:
+        maintenance_stop.set()
         server.server_close()
+        logger.warning("server stopped")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        logging.getLogger("codex.bridge").exception("bridge terminated with an error")
+        raise

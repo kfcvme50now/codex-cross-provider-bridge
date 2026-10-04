@@ -11,8 +11,8 @@ param(
         "set-policy"
     )]
     [string]$Action = "status",
-    [string]$CodexHome = (Join-Path $env:USERPROFILE ".codex"),
-    [string]$ConfigPath = "$env:USERPROFILE\.codex\config.toml",
+    [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }),
+    [string]$ConfigPath = $(Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }) "config.toml"),
     [string]$PolicyPath = "",
     [string]$StatusFile = "",
     [ValidateSet(
@@ -37,7 +37,13 @@ param(
     [string]$SessionStartMode = "repair",
     [ValidateSet("disabled", "inspect", "repair")]
     [string]$RouteRepairMode = "repair",
-    [string]$BridgeUrl = "http://127.0.0.1:15722/v1",
+    [string]$BridgeUrl = $(if ($env:CODEX_BRIDGE_URL) { $env:CODEX_BRIDGE_URL } else { "http://127.0.0.1:15722/v1" }),
+    [ValidateSet("true", "false")]
+    [string]$OfficialBridgeEnabled = "",
+    [string]$CcSwitchDatabase = "",
+    [string]$UpstreamUrl = "",
+    [ValidateSet("true", "false")]
+    [string]$PortableHistoryViaBridge = "",
     [ValidateRange(1, 300)]
     [int]$ProbeTimeoutSeconds = 30,
     [string]$BackupDirectory = "",
@@ -84,7 +90,16 @@ if ($Action -eq "install-hooks" -or $Action -eq "set-policy") {
     $arguments += @("--bridge-url", $BridgeUrl)
 }
 
+if ($CcSwitchDatabase) { $arguments += @("--cc-switch-db", $CcSwitchDatabase) }
+if ($UpstreamUrl) { $arguments += @("--cc-switch-url", $UpstreamUrl) }
+
 if ($Action -eq "set-policy") {
+    if ($PSBoundParameters.ContainsKey("OfficialBridgeEnabled")) {
+        $arguments += @("--official-bridge-enabled", $OfficialBridgeEnabled)
+    }
+    if ($PSBoundParameters.ContainsKey("PortableHistoryViaBridge")) {
+        $arguments += @("--portable-history-via-bridge", $PortableHistoryViaBridge)
+    }
     if ($PSBoundParameters.ContainsKey("CompactMode") -and $CompactMode) {
         $arguments += @("--compact-mode", $CompactMode)
     }

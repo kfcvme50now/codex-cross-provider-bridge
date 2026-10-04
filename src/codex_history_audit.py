@@ -7,6 +7,7 @@ import argparse
 import json
 import sqlite3
 import tomllib
+from codex_bridge_environment import default_codex_home, default_config_path
 from pathlib import Path
 
 
@@ -151,10 +152,10 @@ def audit_history(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument(
         "--config",
-        default=str(Path.home() / ".codex" / "config.toml"),
+        default=str(default_config_path()),
     )
     parser.add_argument(
         "--scope",

@@ -10,6 +10,7 @@ import os
 import subprocess
 import time
 import tomllib
+from codex_bridge_environment import default_codex_home, default_config_path
 from pathlib import Path
 from typing import Callable
 
@@ -321,8 +322,8 @@ def maybe_probe_after_switch(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=str(Path.home() / ".codex" / "config.toml"))
-    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--config", default=str(default_config_path()))
+    parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument("--mode", choices=("disabled", "cli", "app-server"), required=True)
     parser.add_argument("--scope", choices=("preserve", "next", "all"), default="next")
     parser.add_argument("--timeout-seconds", type=int, default=30)

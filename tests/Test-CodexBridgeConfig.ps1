@@ -277,17 +277,20 @@ wire_api = "responses"
     $routeProfile = Join-Path $repositoryRoot "config\codex-route-default.json"
     $routeOutput = & $bridgeManager `
         -Action restore-route `
+        -BridgePort 18122 `
         -ConfigPath $routeConfig `
         -BridgeStateDirectory $managedState `
         -RouteProfilePath $routeProfile
     $routeText = $routeOutput -join "`n"
     Assert-True ($routeText -match '(?m)^route_restore=restored$') "default route restore did not run"
     $routeContent = Get-Content -Raw -LiteralPath $routeConfig
-    Assert-True ($routeContent -match '(?m)^model_provider = "cc-switch-official"$') "model_provider was not restored"
-    Assert-True ($routeContent -match '(?ms)^\[model_providers\.cc-switch-official\]\s*\r?\n.*base_url = "http://127\.0\.0\.1:15722/v1"') "restored provider must point at the bridge"
+    Assert-True ($routeContent -match '(?m)^model_provider = "cc-switch-official"\r?$') "model_provider was not restored"
+    Assert-True ($routeContent -match '(?ms)^\[model_providers\.cc-switch-official\]\s*\r?\n.*base_url = "http://127\.0\.0\.1:18122/__codex_official__"') "restored provider must use the selected official bridge port"
+    Assert-True ($routeContent -match '(?m)^model = "example-model"\r?$') "route restore changed the selected model"
     $routeHash = Get-Sha256Hex -Path $routeConfig
     $routeAgain = & $bridgeManager `
         -Action restore-route `
+        -BridgePort 18122 `
         -ConfigPath $routeConfig `
         -BridgeStateDirectory $managedState `
         -RouteProfilePath $routeProfile

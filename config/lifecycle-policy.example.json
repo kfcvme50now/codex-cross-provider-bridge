@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "compactRepairMode": "repair-and-continue",
+  "autoBranchEnabled": false,
+  "branchBackend": "app-server",
+  "postSwitchProbeMode": "disabled",
+  "postSwitchScope": "preserve",
+  "sessionStartMode": "repair",
+  "routeRepairMode": "repair",
+  "probeTimeoutSeconds": 30,
+  "officialBridgeEnabled": true,
+  "portableHistoryViaBridge": true
+}

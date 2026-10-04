@@ -7,6 +7,7 @@ import argparse
 import json
 import shutil
 import time
+from codex_bridge_environment import default_codex_home, default_config_path, default_cc_switch_db, default_cc_switch_url
 from pathlib import Path
 
 from codex_hook_manager import (
@@ -121,10 +122,10 @@ def parse_args() -> argparse.Namespace:
             "set-policy",
         ),
     )
-    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument(
         "--config",
-        default=str(Path.home() / ".codex" / "config.toml"),
+        default=str(default_config_path()),
     )
     parser.add_argument("--policy", required=True)
     parser.add_argument("--status-file", required=True)
@@ -166,7 +167,11 @@ def parse_args() -> argparse.Namespace:
         choices=("disabled", "inspect", "repair"),
     )
     parser.add_argument("--bridge-url", default=DEFAULT_BRIDGE_URL)
+    parser.add_argument("--cc-switch-db", default=str(default_cc_switch_db()))
+    parser.add_argument("--cc-switch-url", default=default_cc_switch_url())
     parser.add_argument("--probe-timeout-seconds", type=int)
+    parser.add_argument("--official-bridge-enabled", choices=("true", "false"))
+    parser.add_argument("--portable-history-via-bridge", choices=("true", "false"))
     parser.add_argument("--apply", action="store_true")
     return parser.parse_args()
 
@@ -210,6 +215,10 @@ def main() -> int:
             policy["routeRepairMode"] = args.route_repair_mode
         if args.probe_timeout_seconds is not None:
             policy["probeTimeoutSeconds"] = args.probe_timeout_seconds
+        if args.official_bridge_enabled is not None:
+            policy["officialBridgeEnabled"] = args.official_bridge_enabled == "true"
+        if args.portable_history_via_bridge is not None:
+            policy["portableHistoryViaBridge"] = args.portable_history_via_bridge == "true"
         if args.apply:
             backup_file = _backup_policy_file(policy_path)
             saved = save_lifecycle_policy(policy_path, policy)
@@ -227,6 +236,8 @@ def main() -> int:
             lifecycle_script=Path(args.lifecycle_script),
             python_executable=Path(args.python_executable),
             bridge_url=args.bridge_url,
+            cc_switch_db=Path(args.cc_switch_db),
+            cc_switch_url=args.cc_switch_url,
             apply=args.apply,
         )
     elif args.action == "uninstall-hooks":

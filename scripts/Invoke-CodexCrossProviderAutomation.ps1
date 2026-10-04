@@ -5,8 +5,8 @@
     Justification = "Parameters are consumed by nested functions in this script."
 )]
 param(
-    [string]$CodexHome = (Join-Path $env:USERPROFILE ".codex"),
-    [string]$ConfigPath = "$env:USERPROFILE\.codex\config.toml",
+    [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }),
+    [string]$ConfigPath = $(Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }) "config.toml"),
     [int]$BridgePort = 15722,
     [ValidateSet("none", "all", "conversation")]
     [string]$HistoryScope = "all",

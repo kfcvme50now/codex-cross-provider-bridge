@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$ConfigPath = "$env:USERPROFILE\.codex\config.toml",
-    [string]$CodexHome = (Join-Path $env:USERPROFILE ".codex"),
+    [string]$ConfigPath = $(Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }) "config.toml"),
+    [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }),
     [ValidateSet("disabled", "cli", "app-server")]
     [string]$Mode = "cli",
     [ValidateSet("preserve", "next", "all")]

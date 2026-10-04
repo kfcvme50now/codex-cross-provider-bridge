@@ -1,182 +1,46 @@
 # 作用范围与状态
 
-Bridge 支持三种运行时范围。
+适用于 0.3.0。
 
-## `all`
+## 请求范围
 
-所有 Responses 请求都经过 Bridge 策略。`default` 与
-`anyrouter-codex-gpt6` 会先尝试保留原 Provider 的响应 ID 和加密 reasoning，只有
-明确遭到上游拒绝时才降级清理；其他 Provider 默认直接使用可移植请求副本。
+- `all`：持续处理原生 Codex Responses 请求。
+- `next`：只处理下一条匹配请求。
+- `conversation`：只处理指定会话 ID，或锁定下一条匹配会话。
 
-## `next`
+浏览器来源不会消耗 Codex 策略范围，也不进行兼容清理、provider 选择和重试。专用官方入口拒绝浏览器来源。
 
-只对下一条 Responses 请求生效，处理后自动解除。适合临时验证或只修复一次。
+官方请求通常保留原生 reasoning；外来合成状态或窄范围的 item 状态错误触发兼容处理。第三方 provider 如需先保留自身状态，可显式传入 `--preserve-state-provider`。瞬态重试另用 `--retry-provider`，默认不绑定任何本机 provider ID。
 
-## `conversation`
+## 推荐自动维护
 
-可以指定会话 ID；也可以不指定 ID，让 Bridge 自动锁定下一个会话。
+同一个 Bridge 进程中的路由维护线程检查 CC Switch 写入后的稳定配置。仅维护已知官方路由与当前受管理的第三方路由，不覆盖未知外部 provider 配置。原生 CC Switch 上游模板的真实地址保持不变。
+
+推荐 lifecycle policy：
+
+```json
+{
+  "officialBridgeEnabled": true,
+  "portableHistoryViaBridge": true,
+  "compactRepairMode": "repair-and-continue",
+  "autoBranchEnabled": false,
+  "postSwitchProbeMode": "disabled",
+  "postSwitchScope": "preserve"
+}
+```
+
+完整示例见 `config/lifecycle-policy.example.json`。该模式不自动迁移会话或创建分支，不需要额外自动化进程。
+
+## 状态检查
 
 ```powershell
-.\scripts\Manage-CodexCrossProviderBridge.ps1 `
-  -Action repair `
-  -RuntimeScope conversation `
-  -ConversationId "<conversation-id>"
+./scripts/Manage-CodexCrossProviderBridge.ps1 -Action status
 ```
 
-自动锁定下一个会话：
+`/__bridge/info` 返回本机进程 ID、活动请求数和维护功能状态。status、runtime log、request-log 用于区分路由、客户端和上游失败；HTTP 200 响应头不能代替完整流完成。
 
-```powershell
-.\scripts\Manage-CodexCrossProviderBridge.ps1 `
-  -Action repair `
-  -RuntimeScope conversation `
-  -LockNextConversation
-```
+状态文件可能包含会话 ID、标题和工作目录。这些本机内容不属于公开版本，不要提交，也不要直接粘贴到公开 issue。
 
-Fork 会产生新的会话 ID，因此指定旧会话 ID 时，fork 后不会命中。此时可通过状态
-输出取得新会话 ID，或改用 `next` / 自动锁定模式。
+## 旧的自动化入口
 
-## 自动修复范围
-
-```powershell
-.\scripts\Manage-CodexCrossProviderBridge.ps1 `
-  -Action enable-automation `
-  -AutoHistoryScope all
-```
-
-表示自动迁移所有满足安全条件的闲置历史会话。
-
-```powershell
-.\scripts\Manage-CodexCrossProviderBridge.ps1 `
-  -Action enable-automation `
-  -AutoHistoryScope conversation `
-  -ConversationId "<conversation-id>"
-```
-
-表示只迁移指定会话。默认跳过 Bridge 最近请求对应的当前会话；如确需处理当前
-会话，可增加 `-IncludeCurrentConversation`。
-
-`AutoHistoryScope none` 只保留自动路由修复，不迁移任何历史会话。
-
-## 生命周期作用范围
-
-压缩修复和会话启动修复分别配置：
-
-```text
-CompactHookMode=disabled|inspect|repair-and-continue|repair-and-stop|
-                repair-and-branch|branch-only|block-only
-SessionStartMode=disabled|repair|repair-and-probe
-RouteRepairMode=disabled|inspect|repair
-```
-
-自动化探测和切换后的请求范围分别配置：
-
-```text
-PostSwitchProbeMode=disabled|cli|app-server
-PostSwitchScope=preserve|next|all
-```
-
-`next` 表示只让下一条新会话请求进入 Bridge 清理范围；`all` 表示持续生效；
-`preserve` 表示不改现有 Bridge policy。
-
-分支模式由两个开关共同约束：
-
-```text
-CompactHookMode=branch-only / repair-and-branch
-AllowAutoBranch=true
-```
-
-默认 `AllowAutoBranch=false`。未显式开启时，即使选择了分支模式也会安全地
-阻止本次压缩。
-
-## 历史范围
-
-- `HistoryScope all`：确保 `custom` 与 `cc-switch-official` 两个历史桶都可解析。
-- `HistoryScope conversation`：只审计指定会话，并补足该会话实际引用的 provider。
-- `HistoryScope none`：只配置运行时 Bridge，不改变历史兼容配置。
-
-## 状态字段
-
-`Manage-CodexCrossProviderBridge.ps1 -Action status` 会显示：
-
-```text
-runtime_scope
-runtime_armed
-automation_task_present
-automation_task_state
-automation_config_repair_status
-automation_history_status
-automation_history_candidate_count
-automation_history_applied_count
-automation_post_switch_probe_status
-automation_post_switch_probe_ok
-automation_post_switch_probe_error_category
-automation_post_switch_policy_status
-automation_post_switch_policy_scope
-lifecycle_hooks_installed
-lifecycle_hook_backup_count
-compact_repair_mode
-auto_branch_enabled
-session_start_mode
-route_repair_mode
-post_switch_probe_mode
-post_switch_scope
-lifecycle_status_event
-lifecycle_status_result
-lifecycle_status_title
-lifecycle_status_cwd
-target_conversation_id
-last_conversation_id
-last_conversation_title
-last_conversation_cwd
-last_conversation_provider
-last_needs_repair
-last_repair_status
-last_upstream_status
-last_request_path
-last_request_outcome
-last_active_provider_id
-last_error_category
-last_retry_suppressed
-last_circuit_open_until
-last_attempts
-last_retries
-last_failure_origin
-last_failure_evidence
-last_failure_boundary
-last_routed_provider_id
-last_provider_selection_source
-in_flight_request_count
-conversation_history_repair_required
-```
-
-这些字段用于回答两个问题：
-
-1. 当前命中的是哪条会话？
-2. 下一次请求是否会自动执行修复？
-
-另外三个字段用于回答“上一次请求到底怎么了”：
-
-- `last_request_path`：最后一次请求的路径（`/v1/responses` 或
-  `/v1/responses/compact`）。
-- `last_request_source` / `last_request_user_agent`：请求来源，优先取 `originator`
-  头，否则按 User-Agent 归类（如 `codex_cli_rs`、`browser`），用于把不同客户端的
-  请求分开查看；每次完成的请求还会向 `state/request-log.jsonl` 追加一行仅含元数据
-  的记录（超过 16 MB 时滚动为 `.1`）。
-- `last_request_outcome`：`completed`、`upstream-idle-timeout`、
-  `upstream-headers-timeout`、`upstream-empty-response`、`client-aborted`、
-  `upstream-error`、`provider-upstream-error` 或 `provider-blocked`。
-- `last_active_provider_id`：Bridge 从 CC Switch 数据库只读取得的当前 Provider ID。
-- `last_error_category`：例如 `provider_disabled`、`upstream_provider_error`、
-  `local_router_error`、`client_request_error` 或 `provider_path_error`。
-- `last_attempts` / `last_retries`：本次请求的实际尝试次数与重试次数。
-- `last_failure_origin` / `last_failure_evidence` / `last_failure_boundary`：依据 CC Switch
-  结构化错误或实际连接边界给出的归因；证据不足时 origin 为 `indeterminate`。
-- `last_routed_provider_id` / `last_provider_selection_source`：显式请求级路由及其来源。
-- `last_retry_suppressed` / `last_circuit_open_until`：仅在显式启用旧健康门禁/短路策略时
-  使用；AnyRouter 默认不再跨请求短路。
-- `in_flight_request_count`：仍在转发中的请求数量；大于 0 时还会输出
-  `in_flight_request=<path> started_at=<时间戳>`。
-
-上游停滞阈值由 Bridge 启动参数控制（首包默认 600 秒，为远程压缩 90–200 秒的
-首包耗时留出余量；空闲默认 120 秒；`0`
-表示关闭），详见 [`../README.md`](../README.md) 的“上游停滞保护”。
+`enable-automation` 与历史迁移入口仍保留，推荐部署不启用。尤其不要对分页历史执行未经验证的批量迁移。自动维护能力由当前 lifecycle policy 决定，不能仅凭旧脚本默认值判断正在执行哪些修复。

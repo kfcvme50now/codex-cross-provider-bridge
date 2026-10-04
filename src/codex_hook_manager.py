@@ -10,13 +10,15 @@ import os
 import shutil
 import sys
 import time
+from codex_bridge_environment import default_codex_home
+from codex_bridge_environment import default_bridge_url, default_cc_switch_db, default_cc_switch_url
 from pathlib import Path
 
 
 MARKER = "codex_lifecycle_hook.py"
 WRAPPER_MARKER = "codex-lifecycle-hook"
 BACKUP_FOLDER = "codex-cross-provider-hooks"
-DEFAULT_BRIDGE_URL = "http://127.0.0.1:15722/v1"
+DEFAULT_BRIDGE_URL = default_bridge_url()
 MANAGED_EVENTS = ("PreCompact", "SessionStart", "UserPromptSubmit")
 
 
@@ -95,6 +97,8 @@ def _managed_command(
     config_path: Path,
     status_path: Path,
     bridge_url: str = DEFAULT_BRIDGE_URL,
+    cc_switch_db: Path | None = None,
+    cc_switch_url: str = "",
 ) -> str:
     return " ".join(
         [
@@ -110,6 +114,10 @@ def _managed_command(
             _quote_command_part(status_path),
             "--bridge-url",
             bridge_url,
+            "--cc-switch-db",
+            _quote_command_part(cc_switch_db or default_cc_switch_db()),
+            "--cc-switch-url",
+            _quote_command_part(cc_switch_url or default_cc_switch_url()),
             "--route-repair-script",
             _quote_command_part(route_repair_script_for(lifecycle_script)),
             "--apply",
@@ -310,6 +318,8 @@ def install_lifecycle_hooks(
     python_executable: Path,
     apply: bool,
     bridge_url: str = DEFAULT_BRIDGE_URL,
+    cc_switch_db: Path | None = None,
+    cc_switch_url: str = "",
 ) -> dict:
     hooks_path = codex_home / "hooks.json"
     payload = _load_hooks(hooks_path)
@@ -321,11 +331,14 @@ def install_lifecycle_hooks(
         config_path=config_path,
         status_path=status_path,
         bridge_url=bridge_url,
+        cc_switch_db=cc_switch_db,
+        cc_switch_url=cc_switch_url,
     )
     wrapper_path = wrapper_script_path(codex_home)
     command = str(wrapper_path)
     installed = _is_installed(payload)
-    if installed and _is_current_install(payload, command):
+    if (installed and _is_current_install(payload, command) and wrapper_path.is_file()
+            and inner_command in wrapper_path.read_text(encoding="utf-8").splitlines()):
         return {
             "status": "already-installed",
             "hooksPath": str(hooks_path),
@@ -469,7 +482,7 @@ def restore_hook_backup(backup_directory: Path, apply: bool) -> dict:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("install", "uninstall", "restore"))
-    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument("--policy", default="")
     parser.add_argument("--config", default="")
     parser.add_argument("--status-file", default="")

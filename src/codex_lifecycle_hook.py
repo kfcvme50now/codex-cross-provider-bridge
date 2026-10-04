@@ -5,13 +5,15 @@ from __future__ import annotations
 
 
 import argparse
+import http.client
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import time
+from codex_bridge_environment import default_codex_home, default_cc_switch_db, default_config_path
+from codex_bridge_environment import default_bridge_url
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
@@ -27,6 +29,9 @@ from codex_lifecycle_policy import (
 )
 from codex_provider_probe import run_configured_probe
 from codex_thread_provider_migrate import apply_thread_provider_migration
+from codex_official_bridge_config import OFFICIAL_BRIDGE_URL, project_official_bridge
+from codex_route_projection import project_known_route, write_projection
+from codex_bridge_environment import default_cc_switch_url, endpoint, official_bridge_url
 
 
 BranchRunner = Callable[..., dict]
@@ -34,7 +39,7 @@ ProbeRunner = Callable[..., dict]
 RouteRepairRunner = Callable[[Path, str], dict]
 BridgeEnsureRunner = Callable[[str], dict]
 
-DEFAULT_BRIDGE_URL = "http://127.0.0.1:15722/v1"
+DEFAULT_BRIDGE_URL = default_bridge_url()
 ROUTE_REPAIR_TIMEOUT_SECONDS = 180
 
 
@@ -78,6 +83,11 @@ def run_precompact_hook(
 ) -> dict:
     normalized = _normalize_policy(policy)
     session_id = str(event.get("session_id") or "").strip()
+    if normalized["portableHistoryViaBridge"]:
+        # Hooks cannot replace already-loaded context. Repair request copies in
+        # the bridge; this guard only ensures that the transport is available.
+        return run_user_prompt_submit_hook(event, policy, codex_home, config_path,
+            status_path, apply, route_repair_script=Path(__file__).parents[1] / "scripts/Repair-Codex-CCSwitchProviderAlias.ps1")
     decision = decide_compact_action(
         codex_home=codex_home,
         config_path=config_path,
@@ -254,7 +264,14 @@ def run_session_start_hook(
     bridge_ensure_result: dict = {}
 
     try:
-        route = inspect_config_route(config_path)
+        route = inspect_config_route(config_path, bridge_url=target_url)
+        if normalized["officialBridgeEnabled"] and route.get("officialModelOrProvider"):
+            target_url = official_bridge_url(target_url)
+            route["eligibleForAutomaticBridgeRepair"] = True
+        elif normalized["portableHistoryViaBridge"]:
+            _, kind = project_known_route(config_path.read_text(encoding="utf-8"), default_cc_switch_db(), target_url, default_cc_switch_url())
+            if kind == "cc-switch":
+                route["eligibleForAutomaticBridgeRepair"] = True
         route_before = str(route.get("baseUrl") or "").rstrip("/")
         route_after = route_before
         if normalized["routeRepairMode"] == "disabled":
@@ -273,7 +290,9 @@ def run_session_start_hook(
                     route_repair_script,
                 )
             )
-            repair = runner(config_path, target_url)
+            repair, bridge_ensure_result = _repair_after_bridge_ready(
+                runner, config_path, target_url, route_repair_script, bridge_ensure_runner
+            )
             if repair.get("ok"):
                 route_repair_result = "repaired"
                 route_after = target_url
@@ -293,6 +312,7 @@ def run_session_start_hook(
         and route_after == target_url
         and normalized["routeRepairMode"] != "disabled"
         and (bridge_ensure_runner is not None or route_repair_script is not None)
+        and not bridge_ensure_result
     ):
         ensure_runner = bridge_ensure_runner or (
             lambda bridge: run_configured_bridge_ensure(
@@ -322,7 +342,9 @@ def run_session_start_hook(
     migration_result = None
     probe_result = None
     error = ""
-    if normalized["sessionStartMode"] == "disabled":
+    if normalized["portableHistoryViaBridge"]:
+        result_status = "request-copy-repair-enabled"
+    elif normalized["sessionStartMode"] == "disabled":
         result_status = "disabled"
     elif not decision["remoteCompactRisk"]:
         result_status = "not-required"
@@ -438,6 +460,31 @@ def run_configured_route_repair(
     repair_script: Path | None,
 ) -> dict:
     """Repair the live route through the same script the CLI repair action uses."""
+    if urlsplit(bridge_url).path.rstrip("/") == "/__codex_official__":
+        original = config_path.read_text(encoding="utf-8")
+        updated, changed = project_official_bridge(original, bridge_url, default_cc_switch_url())
+        if changed:
+            backup = config_path.parent / "backups/official-bridge-hook" / str(time.time_ns())
+            backup.mkdir(parents=True, exist_ok=False)
+            (backup / "config.toml").write_text(original, encoding="utf-8")
+            temporary = config_path.with_suffix(f".official-bridge-{os.getpid()}.tmp")
+            temporary.write_text(updated, encoding="utf-8")
+            if config_path.read_text(encoding="utf-8") != original:
+                temporary.unlink()
+                return {"ok": False, "error": "Concurrent config edit preserved"}
+            temporary.replace(config_path)
+        return {"ok": True, "status": "repaired" if changed else "unchanged"}
+    if urlsplit(bridge_url).path.rstrip("/") == "/v1":
+        original = config_path.read_text(encoding="utf-8")
+        updated, kind = project_known_route(original, default_cc_switch_db(), bridge_url, default_cc_switch_url())
+        if kind == "cc-switch":
+            import socket
+            with socket.create_connection(endpoint(default_cc_switch_url()), timeout=1):
+                pass
+            changed = write_projection(config_path, original, updated, config_path.parent / "backups/automatic-route-projection")
+            if not changed and original != updated:
+                return {"ok": False, "error": "Concurrent config edit preserved"}
+            return {"ok": True, "status": "repaired" if changed else "unchanged"}
     if repair_script is None or not repair_script.is_file():
         return {
             "ok": False,
@@ -501,13 +548,52 @@ def _bridge_endpoint(bridge_url: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port
 
 
+def _repair_after_bridge_ready(runner, config_path, bridge_url, repair_script, ensure_runner):
+    """Never project a loopback route before its service is ready."""
+    ensured = {}
+    if ensure_runner is not None or repair_script is not None:
+        ensure = ensure_runner or (lambda url: run_configured_bridge_ensure(url, repair_script))
+        try:
+            ensured = ensure(bridge_url)
+        except Exception as exc:
+            ensured = {"ok": False, "status": "start-error", "error": str(exc)}
+        if not ensured.get("ok"):
+            return {"ok": False, "status": "bridge-start-failed",
+                    "error": ensured.get("error") or "Bridge readiness check failed; route unchanged"}, ensured
+    original = config_path.read_bytes()
+    repair = runner(config_path, bridge_url)
+    if repair.get("ok") and ensured:
+        changed = config_path.read_bytes()
+        try:
+            ensured = ensure(bridge_url)
+        except Exception as exc:
+            ensured = {"ok": False, "error": str(exc)}
+        if not ensured.get("ok"):
+            restored = False
+            if config_path.read_bytes() == changed:
+                temporary = config_path.with_suffix(f".bridge-rollback-{os.getpid()}.tmp")
+                temporary.write_bytes(original)
+                temporary.replace(config_path)
+                restored = True
+            return {"ok": False, "status": "bridge-start-failed", "routeRestored": restored,
+                    "error": "Bridge became unavailable during route repair; " +
+                    ("original route restored" if restored else "concurrent config edit preserved")}, ensured
+    return repair, ensured
+
+
 def _bridge_is_listening(bridge_url: str, timeout: float = 0.25) -> bool:
     host, port = _bridge_endpoint(bridge_url)
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
+        connection.request("GET", "/__bridge/info")
+        response = connection.getresponse()
+        info = json.loads(response.read(65536))
+        return (response.status == 200 and bool(info.get("pid")) and bool(info.get("statusFile"))
+                and (not bridge_url.endswith("/__codex_official__") or info.get("officialCompatibilityRoute") is True))
+    except (OSError, ValueError, http.client.HTTPException):
         return False
+    finally:
+        connection.close()
 
 
 def run_configured_bridge_ensure(
@@ -617,13 +703,20 @@ def run_user_prompt_submit_hook(
     bridge_ensure_result: dict = {}
 
     try:
-        route = inspect_config_route(config_path)
+        route = inspect_config_route(config_path, bridge_url=target_url)
     except (OSError, ValueError) as exc:
         route = {}
         result_status = "config-unreadable"
         error = str(exc)
 
     if route:
+        if normalized["officialBridgeEnabled"] and route.get("officialModelOrProvider"):
+            target_url = official_bridge_url(target_url)
+            route["eligibleForAutomaticBridgeRepair"] = True
+        elif normalized["portableHistoryViaBridge"]:
+            _, kind = project_known_route(config_path.read_text(encoding="utf-8"), default_cc_switch_db(), target_url, default_cc_switch_url())
+            if kind == "cc-switch":
+                route["eligibleForAutomaticBridgeRepair"] = True
         provider = str(route.get("activeProvider") or "")
         route_before = str(route.get("baseUrl") or "").rstrip("/")
         route_after = route_before
@@ -644,7 +737,9 @@ def run_user_prompt_submit_hook(
                 )
             )
             try:
-                repair_result = runner(config_path, target_url)
+                repair_result, bridge_ensure_result = _repair_after_bridge_ready(
+                    runner, config_path, target_url, route_repair_script, bridge_ensure_runner
+                )
             except Exception as exc:  # noqa: BLE001 - a hook must not crash the prompt
                 repair_result = {
                     "ok": False,
@@ -655,7 +750,7 @@ def run_user_prompt_submit_hook(
                 result_status = "repaired"
                 route_after = target_url
             else:
-                result_status = "repair-failed"
+                result_status = "bridge-start-failed" if repair_result.get("status") == "bridge-start-failed" else "repair-failed"
                 error = str(
                     repair_result.get("error")
                     or repair_result.get("status")
@@ -667,6 +762,7 @@ def run_user_prompt_submit_hook(
         and route_after == target_url
         and mode != "disabled"
         and (bridge_ensure_runner is not None or route_repair_script is not None)
+        and not bridge_ensure_result
     ):
         ensure_runner = bridge_ensure_runner or (
             lambda bridge: run_configured_bridge_ensure(
@@ -760,14 +856,16 @@ def run_user_prompt_submit_hook(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--policy", required=True)
-    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument(
         "--config",
-        default=str(Path.home() / ".codex" / "config.toml"),
+        default=str(default_config_path()),
     )
     parser.add_argument("--status-file", required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--bridge-url", default=DEFAULT_BRIDGE_URL)
+    parser.add_argument("--cc-switch-db", default=str(default_cc_switch_db()))
+    parser.add_argument("--cc-switch-url", default=default_cc_switch_url())
     parser.add_argument("--route-repair-script", default="")
     return parser.parse_args()
 
@@ -779,6 +877,10 @@ def main() -> int:
         return 0
 
     args = parse_args()
+    # Hook wrappers persist the installer parameters, without depending on the
+    # desktop app inheriting the interactive shell's environment.
+    os.environ["CC_SWITCH_DB"] = args.cc_switch_db
+    os.environ["CODEX_BRIDGE_UPSTREAM_URL"] = args.cc_switch_url
     try:
         event = json.load(sys.stdin)
     except json.JSONDecodeError:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from codex_bridge_environment import default_codex_home, default_config_path
 from pathlib import Path
 
 from codex_history_audit import is_official_model, read_thread_rows
@@ -222,10 +223,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Safely migrate provider-sensitive Codex conversations."
     )
-    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument(
         "--config",
-        default=str(Path.home() / ".codex" / "config.toml"),
+        default=str(default_config_path()),
     )
     parser.add_argument(
         "--scope",

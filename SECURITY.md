@@ -1,17 +1,24 @@
-# Security
+# 安全和隐私
 
-The bridge is intended to listen on loopback only and forward to a configured
-HTTP or HTTPS upstream.
+服务仅用于本机回环地址。不要把端口开放到局域网或公网。
 
-It does not log request bodies, authorization headers, API keys, or local user
-content. Status snapshots and automation status may contain conversation IDs,
-titles, and working directories from the local Codex database; keep the
-`state/`, migration backups, and snapshot directories out of version control.
+## 凭证边界
 
-Provider probes send a fixed, non-user prompt and persist only status metadata;
-they do not persist response text or credentials. Lifecycle status and branch
-history also contain conversation IDs, titles, and working directories. Hook
-and policy backups may contain the previous local hook configuration and must
-be treated with the same local-data restrictions.
+- 不把 API key、OAuth token、Authorization 或 cookie 写进源码、示例、命令参数或 Git。
+- 官方 Codex 入口固定连接 ChatGPT Codex 官方端点。官方登录信息不能用于第三方路由。
+- 第三方凭证交由 CC Switch 管理；显式路由需要凭证时只配置环境变量名。
+- 浏览器来源信号优先于声称的客户端身份。原生来源识别是兼容边界，不是强身份认证。
 
-Do not expose the bridge port to a LAN or the public internet.
+## 本机数据
+
+Bridge 不记录请求正文、Authorization 或响应正文。状态文件可能含会话 ID、标题和目录；错误和上游诊断也可能包含本机信息。日志、数据库、历史、hook 配置、策略备份与归档不可公开提交。
+
+`.gitignore` 不会自动移除已经跟踪的文件。发布前运行 `scripts/check_publication.py`，检查待提交文件，并使用 Gitleaks 扫描工作树及 Git 历史。Gitleaks 配置额外检查私有用户主目录路径。
+
+不要通过运行状态文件、真实请求捕获、认证文件或数据库来制作公开的测试夹具。测试仅使用合成数据和临时目录。
+
+恢复档案应保存在本机，且按可能含凭证的文件处理。确认恢复内容之前，不永久删除备份。
+
+## 兼容范围
+
+这不是安全隔离代理或通用协议网关。客户端版本、provider、模型与上游支持能力变化后需要重新验证。旧迁移工具可能修改 rollout 与 SQLite；推荐工作流仅修复请求副本与客户端路由配置。

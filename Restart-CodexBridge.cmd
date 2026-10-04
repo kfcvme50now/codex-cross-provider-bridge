@@ -3,7 +3,8 @@ setlocal
 chcp 65001 >nul
 set "MANAGER=%~dp0scripts\Manage-CodexCrossProviderBridge.ps1"
 set "ACTION=%~1"
-if "%ACTION%"=="" set "ACTION=restart"
+if "%ACTION%"=="" set "ACTION=foreground"
+title Codex Bridge - Foreground Console
 
 if not exist "%MANAGER%" (
     echo [ERROR] Not found: %MANAGER%
@@ -34,6 +35,6 @@ if not "%EXITCODE%"=="0" (
     exit /b %EXITCODE%
 )
 
-echo [OK] Window closes in 5 seconds ...
-"%SystemRoot%\System32\timeout.exe" /t 5 /nobreak >nul 2>nul
+echo [STOPPED] Bridge command completed. Press any key to close this window.
+pause >nul
 exit /b 0

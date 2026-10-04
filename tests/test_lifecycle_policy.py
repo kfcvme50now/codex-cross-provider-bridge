@@ -418,6 +418,63 @@ def write_route_config(
 
 
 class RouteRepairHookTests(unittest.TestCase):
+    def test_bridge_loss_during_repair_rolls_back_only_our_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);config=root/'config.toml';write_route_config(config)
+            before=config.read_bytes();checks=iter([{'ok':True},{'ok':False}])
+            def repair(path,url):
+                write_route_config(path,base_url=url)
+                return {'ok':True}
+            result,status,_=self._run(root,config,runner=repair,bridge_ensure_runner=lambda _:next(checks))
+            self.assertFalse(result['continue'])
+            self.assertEqual(config.read_bytes(),before)
+            self.assertTrue(json.loads(status.read_text())['repair']['routeRestored'])
+
+    def test_failed_start_does_not_change_cc_switch_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'config.toml'
+            write_route_config(config)
+            before = config.read_bytes()
+            def forbidden_repair(*args):
+                self.fail('route must not change before Bridge is ready')
+            result, status, _ = self._run(root, config, runner=forbidden_repair,
+                bridge_ensure_runner=lambda _: {'ok': False, 'error': 'startup failed'})
+            self.assertFalse(result['continue'])
+            self.assertEqual(config.read_bytes(), before)
+            self.assertEqual(json.loads(status.read_text())['result'], 'bridge-start-failed')
+
+    def test_ready_check_precedes_route_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'config.toml'
+            write_route_config(config)
+            calls = []
+            def ready(_):
+                calls.append('ready')
+                return {'ok': True}
+            def repair(path, url):
+                self.assertEqual(calls, ['ready'])
+                calls.append('write')
+                write_route_config(path, base_url=url)
+                return {'ok': True}
+            result, _, _ = self._run(root, config, runner=repair, bridge_ensure_runner=ready)
+            self.assertFalse(result['continue'])
+            self.assertEqual(calls, ['ready', 'write', 'ready'])
+
+    def test_session_start_also_preserves_route_if_bridge_start_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, config, conversation = write_fixture(root, model='gpt-6-astra')
+            before = config.read_bytes()
+            def forbidden_repair(*args):
+                self.fail('session startup must not route into a stopped service')
+            run_session_start_hook(event={'session_id': conversation}, policy={},
+                codex_home=home, config_path=config, status_path=root/'status.json', apply=True,
+                route_repair_runner=forbidden_repair,
+                bridge_ensure_runner=lambda _: {'ok': False, 'error': 'startup failed'})
+            self.assertEqual(config.read_bytes(), before)
+
     def _run(
         self,
         root: Path,

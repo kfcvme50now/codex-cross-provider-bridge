@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import time
+from codex_bridge_environment import default_codex_home
 from pathlib import Path
 
 from codex_history_audit import is_official_model, read_runtime_provider_ids
@@ -343,7 +344,7 @@ def apply_thread_provider_migration(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
+    parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument("--conversation-id", required=True)
     parser.add_argument("--target-provider", default="custom")
     parser.add_argument("--apply", action="store_true")
